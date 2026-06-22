@@ -5,6 +5,21 @@ import { raiseError } from "../raiseError.js";
  * No DOM dependency — safe to unit-test directly.
  */
 
+/**
+ * Codecs the browser data plane can actually encode. v1 ships only `LSB16K`
+ * (16 kHz signed PCM, little-endian); `8K` / `MULAW` / `ALAW` await a telephony
+ * requirement (docs/adr/0005, implementation-notes Q9). `codec` is a Core
+ * decision, but the Shell physically produces the bytes — so it MUST reject a
+ * `codec` it cannot encode rather than silently stream `LSB16K` under a
+ * different label (SPEC §13).
+ */
+export const SHELL_SUPPORTED_CODECS: readonly string[] = ["LSB16K"];
+
+/** Whether the Shell's encoder can produce `codec` (case-insensitive — AmiVoice ids are). */
+export function canEncodeCodec(codec: string): boolean {
+  return SHELL_SUPPORTED_CODECS.includes(codec.toUpperCase());
+}
+
 /** Clamp Float32 samples [-1, 1] to signed 16-bit PCM. */
 export function floatTo16BitPCM(input: Float32Array): Int16Array {
   const out = new Int16Array(input.length);

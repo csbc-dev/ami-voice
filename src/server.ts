@@ -17,6 +17,7 @@ export {
 export type {
   AmiVoiceRelayServer, AmiVoiceRelayServerOptions, AmiVoiceControlSession,
   AmiVoiceControlConnectionOptions, AudioSocketLike,
+  AmiVoiceServerLogEvent, AmiVoiceServerLogger,
 } from "./createAmiVoiceServer.js";
 export { AmiVoiceError, mapResultCode, isClientError, getErrorCode } from "./errorCodes.js";
 export type { AmiVoiceErrorCode } from "./errorCodes.js";
@@ -29,6 +30,8 @@ export type { WnnEvent } from "./protocol/wnnProtocol.js";
 // Shared realtime session loop (transport-agnostic; relay + direct).
 export { runRealtimeSession } from "./protocol/realtimeSession.js";
 export type { RealtimeSocket } from "./protocol/realtimeSession.js";
+// Speaker view (derived, final-only — docs/adr/0007).
+export { toSpeakerSegment, speakerLabelOf } from "./speakerView.js";
 
 // `AmiVoiceValues` is intentionally NOT re-exported here: it extends
 // `AmiVoiceCoreValues` with `level` / `mode`, Shell-only properties with no
@@ -36,7 +39,7 @@ export type { RealtimeSocket } from "./protocol/realtimeSession.js";
 // (`AmiVoiceCoreValues`).
 export type {
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers,
-  RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult,
+  RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult, SpeakerSegment,
   AmiVoiceCodec, AmiVoiceEngine,
   SerializedError, WcsAmiVoiceAnyError,
   AmiVoiceCoreValues,

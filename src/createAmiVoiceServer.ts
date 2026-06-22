@@ -1,6 +1,7 @@
 import { AmiVoiceCore } from "./core/AmiVoiceCore.js";
 import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
-import type { IAmiVoiceProvider, AmiVoiceTransport } from "./types.js";
+import type { IAmiVoiceProvider, AmiVoiceTransport, WcsAmiVoiceAnyError } from "./types.js";
+import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
 import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
 
 /**
@@ -27,6 +28,23 @@ import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
  * IP-restrict the one-time APPKEY.
  */
 
+/**
+ * One structured log record from the server helper (Phase 3.5). A discriminated
+ * union so an integrator can route by `type` to their own logger. NOTE: it never
+ * carries the APPKEY (server-only) nor the raw audio session token (a bearer the
+ * SPEC §11.3 keeps out of logs); `error` carries only the normalized `code` +
+ * message, never wire payloads.
+ */
+export type AmiVoiceServerLogEvent =
+  | { type: "control-open"; transport: AmiVoiceTransport; peerAddress?: string }
+  | { type: "control-close"; transport: AmiVoiceTransport; peerAddress?: string }
+  | { type: "audio-open" }
+  | { type: "audio-rejected"; reason: "unknown-session" }
+  | { type: "error"; code?: AmiVoiceErrorCode; message: string };
+
+/** Injectable structured logger (Phase 3.5). Default is a no-op. */
+export type AmiVoiceServerLogger = (event: AmiVoiceServerLogEvent) => void;
+
 export interface AmiVoiceRelayServerOptions {
   /** Provider factory (one per control connection). Defaults to `new AmiVoiceProvider()`. */
   createProvider?: () => IAmiVoiceProvider;
@@ -36,6 +54,12 @@ export interface AmiVoiceRelayServerOptions {
   epi?: number;
   /** Direct mode: shorter expiry when the peer IP is unknown (NAT/proxy — Q12). Default 10. */
   epiWithoutIpa?: number;
+  /**
+   * Structured logger (Phase 3.5). Receives connection open/close, rejected audio
+   * frames, and emitted Core errors. Default: no-op. Sensitive values (APPKEY,
+   * audio token, wire payloads) are never passed to it.
+   */
+  logger?: AmiVoiceServerLogger;
 }
 
 /** Per-control-connection options (direct mode uses the peer address for `ipa`). */
@@ -89,6 +113,7 @@ export function createAmiVoiceRelayServer(
   const transportMode: AmiVoiceTransport = options.transport ?? "relay";
   const epi = options.epi ?? 30;
   const epiWithoutIpa = options.epiWithoutIpa ?? 10;
+  const log: AmiVoiceServerLogger = options.logger ?? (() => { /* no-op */ });
 
   return {
     handleControlConnection(
@@ -117,13 +142,22 @@ export function createAmiVoiceRelayServer(
         });
       }
       const shell = new RemoteShellProxy(core, transport);
+      // Log emitted Core errors (normalized code + message only — never payloads).
+      const onCoreError = (e: Event): void => {
+        const detail = (e as CustomEvent<WcsAmiVoiceAnyError>).detail;
+        if (detail) log({ type: "error", code: getErrorCode(detail), message: detail.message });
+      };
+      core.addEventListener("ami-voice:error", onCoreError);
+      log({ type: "control-open", transport: transportMode, peerAddress: connOptions.peerAddress });
       return {
         core,
         shell,
         dispose: () => {
           if (token) sessions.delete(token);
+          core.removeEventListener("ami-voice:error", onCoreError);
           shell.dispose();
           core.abort();
+          log({ type: "control-close", transport: transportMode, peerAddress: connOptions.peerAddress });
         },
       };
     },
@@ -131,6 +165,7 @@ export function createAmiVoiceRelayServer(
     handleAudioConnection(socket: AudioSocketLike, token: string): boolean {
       const core = sessions.get(token);
       if (!core) {
+        log({ type: "audio-rejected", reason: "unknown-session" });
         socket.close();
         return false;
       }
@@ -140,6 +175,7 @@ export function createAmiVoiceRelayServer(
       };
       if (typeof socket.on === "function") socket.on("message", onData);
       else socket.onmessage = (event) => onData(event.data);
+      log({ type: "audio-open" });
       return true;
     },
 

@@ -2,9 +2,9 @@
 
 Sequenced delivery plan for `@csbc-dev/ami-voice`. Roles of the docs: [ADRs](.) = *why*, [SPEC.md](../SPEC.md) = *what*, [implementation-notes.md](implementation-notes.md) = open *how* (Q1–Q14), **this file = when / in what order**. Each task cites the decision/question it rests on. Sizes are rough: **S** ≤ half-day, **M** ≈ 1–2 days, **L** ≈ 3+ days.
 
-## Current status — Phases 1 & 2 complete
+## Current status — Phases 1 & 2 complete; Phase 3 hardening done
 
-Scaffold, relay implementation, the full relay e2e, AND browser-direct mode are done and green (build clean; 71 unit + 3 Node integration + 2 real-browser Playwright):
+Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 101 unit + 3 Node integration + 2 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
 
 - Bindable surface, Core state machine, target injection, `s`/`p`/`e` builder + `S/E/C/U/A/G` parser, PCM/`LSB16K` encoder, Shell (local/relay/direct, two-channel wiring), mic capture (browser-runtime).
 - Provider realtime WSS loop (injectable socket; shared `runRealtimeSession`), `recognizeFile` (async v2), one-time-APPKEY mint + `prepareDirectSession`, error-code normalization.
@@ -28,7 +28,7 @@ What does **not** exist yet: a real AmiVoice WSS run (needs a paid APPKEY; gated
 | 0 | Scaffold + relay unit impl | build clean, unit tests green | ✅ done |
 | 1 | Relay works end-to-end in a real browser | `<ami-voice>` transcribes against a fake AmiVoice WSS in Playwright; runnable server example; user README | ✅ done — Node e2e + example + README + **real-browser Playwright run** all green |
 | 2 | Browser-direct mode (opt-in) | `transport="direct"` recognizes via one-time APPKEY; relay unchanged | ✅ done — Node + real-browser Playwright green; relay path unchanged |
-| 3 | Hardening + release | reconnect/diarization/codec/security decided; coverage; publishable | ▢ |
+| 3 | Hardening + release | reconnect/diarization/codec/security decided; coverage; publishable | ✅ hardening done (reconnect, `speakers`/ADR 0007, codec rejection, security profile, logging, coverage); release = user-driven version bump + publish |
 
 ---
 
@@ -66,14 +66,14 @@ Add the single-channel, `O(connections)` path enabled by the one-time APPKEY. Re
 
 ## Phase 3 — Hardening & release
 
-- [ ] **3.1 Upstream reconnect policy** (M) — implement the v1 choice (error + `connected=false` + explicit restart; never drop finalized `transcript`). Refs: Q3.
-- [ ] **3.2 Diarization / multilingual surfacing** (S–M, gated) — decide whether to surface speaker `label` / `language` beyond tokens. Refs: Q6 (needs product input).
-- [ ] **3.3 Codec expansion** (M, gated) — add `8K` + `MULAW`/`ALAW` if telephony is in scope; Shell must reject a `codec` it cannot encode. Refs: Q9.
-- [ ] **3.4 Deployment security profile** (M) — auth-before-shell, per-command authz, rate limits, audio token via `Sec-WebSocket-Protocol`, `JsonValue` resource limits; document + example. Refs: SPEC §14, ADR 0002, wc-bindable Remote Security Profile.
-- [ ] **3.5 Structured logging** (S) — injectable `Logger` through the server helper (connection open/close, rejected frames, emitted errors). Refs: implementation-notes B/Q11.
-- [ ] **3.6 Coverage + release prep** (M) — coverage gate; finalize README/SPEC version refs; bump version; publish via the [release skill](../.claude/skills/release/SKILL.md) (confirm `@wc-bindable/*` are `^0.8.0` semver, no `file:`).
+- [x] **3.1 Upstream reconnect policy** (M) — v1 choice implemented: an unsolicited upstream close → `error` (`upstream`) + `connected=false`; finalized `transcript`/`segments`/`confidence` preserved; explicit `start()` to resume (no auto-reconnect). `runRealtimeSession` distinguishes intentional teardown (stop/abort/lost-`e`-ack fallback) from a drop. SPEC §10.1; tested (`__tests__/realtimeSession.test.ts`). Refs: Q3.
+- [x] **3.2 Diarization surfacing** (S–M) — product input arrived: surface a **derived, final-only `speakers` property** (one labeled turn per finalized segment), resolving Q6 toward option (b). New [ADR 0007](adr/0007-diarization-speaker-view.md); `src/speakerView.ts`; SPEC §7.1/§8; contract test updated; tested. (`language` stays on tokens.)
+- [x] **3.3 Codec scope** (gated → documented non-support) — telephony not in scope (Q9), so `8K`/`MULAW`/`ALAW` are **not** added. The non-gated correctness part **is** done: the Shell now **rejects** a `codec` it cannot encode (`canEncodeCodec`; v1 = `LSB16K`) on `start()` rather than silently streaming `LSB16K`. SPEC §13; tested.
+- [x] **3.4 Deployment security profile** (M) — auth-before-shell, per-command authz, audio token via `Sec-WebSocket-Protocol`, rate/resource limits, direct-mode mint validation, observability documented in SPEC §14 + README; the example's `TODO(auth)` is promoted to an `authenticatePeer`/`authorize` seam. Refs: SPEC §14, ADR 0002.
+- [x] **3.5 Structured logging** (S) — injectable `logger` on `createAmiVoiceRelayServer` (control open/close, rejected audio frames, emitted Core errors as normalized `code` + message; never the APPKEY/token/payloads). Tested. Refs: implementation-notes B/Q11.
+- [~] **3.6 Coverage + release prep** (M) — coverage gate done (`npm run test:coverage`, thresholds over the portable logic layer); README/SPEC/CLAUDE status synced. **Remaining (user-driven):** confirm + bump version, then publish via the [release skill](../.claude/skills/release/SKILL.md) (`@wc-bindable/*` are `^0.8.0`, no `file:`). `npm publish` is manual.
 
-**Phase 3 done when:** the package is production-deployable and `0.x` publishable.
+**Phase 3 done when:** the package is production-deployable and `0.x` publishable. Code/docs/coverage are in place; the version bump + publish are the user's manual release step.
 
 ---
 
@@ -101,8 +101,9 @@ The integration harness (1.3) is the spine of Phase 1 and a prerequisite for tru
 | before 1.8 | Q7 error exposure | normalized `code` internal; `{name,message}` on wire |
 | before 2.1 | ADR 0006 token-op shape | **LOCKED** — fold into `start()`; direct returns `DirectSessionInfo` |
 | before 2.5 | Q12 `ipa` strategy | degrade gracefully when address unknown (implemented) |
-| before 3.2 | Q6 diarization | **needs product input** |
-| before 3.3 | Q9 codecs | **needs telephony requirement** |
+| before 3.1 | Q3 upstream reconnect | **RESOLVED** — explicit restart; finalized `transcript` preserved (SPEC §10.1, implemented) |
+| before 3.2 | Q6 diarization | **RESOLVED** — surface a derived final-only `speakers` view ([ADR 0007](adr/0007-diarization-speaker-view.md), implemented) |
+| before 3.3 | Q9 codecs | **RESOLVED (deferred)** — telephony out of scope; v1 `LSB16K` only, Shell rejects others (implemented) |
 
 ## Risks
 

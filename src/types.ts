@@ -130,6 +130,22 @@ export interface InterimResult {
   tokens: RecognitionToken[];
 }
 
+/**
+ * A speaker-labeled finalized turn (docs/adr/0007). A derived, final-only
+ * projection of one `RecognitionSegment`: `label` is the segment's speaker id
+ * (from token `label` with `segmenterProperties="useDiarizer=1"`), or `""` when
+ * not diarized. `segments[].tokens[].label` remains the source of truth; this is
+ * a convenience view so consumers don't re-walk tokens for "who said what".
+ */
+export interface SpeakerSegment {
+  /** Speaker id from diarization, or `""` when undiarized / unknown. */
+  label: string;
+  text: string;
+  starttime: number;
+  endtime: number;
+  confidence: number;
+}
+
 /** Options shared by realtime and file recognition (Core-owned policy). */
 export interface RecognitionOptions {
   engine: AmiVoiceEngine;
@@ -231,6 +247,8 @@ export interface AmiVoiceCoreValues {
   interim: string;
   /** Structured finalized history. */
   segments: RecognitionSegment[];
+  /** Speaker-labeled finalized turns (derived from `segments`; final-only — docs/adr/0007). */
+  speakers: SpeakerSegment[];
   /** Latest finalized-segment confidence (final-only; updates on `A`). */
   confidence: number;
   loading: boolean;

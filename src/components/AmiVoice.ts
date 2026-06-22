@@ -1,6 +1,8 @@
 import { _getInternalConfig, getRemoteCoreUrl } from "../config.js";
 import { IWcBindable, RecognitionSegment } from "../types.js";
-import type { WcsAmiVoiceAnyError, AmiVoiceTransport, DirectSessionInfo } from "../types.js";
+import type {
+  WcsAmiVoiceAnyError, AmiVoiceTransport, DirectSessionInfo, SpeakerSegment,
+} from "../types.js";
 import { AmiVoiceCore } from "../core/AmiVoiceCore.js";
 import { AmiVoiceProvider } from "../providers/AmiVoiceProvider.js";
 import { normaliseError } from "../normaliseError.js";
@@ -14,6 +16,8 @@ import { MicCapture } from "./micCapture.js";
 import { validateRemoteCoreUrl, openAudioChannel } from "./remoteConnection.js";
 import { DirectBrowserProvider } from "./realtimeSocket.js";
 import { shouldSendFrame, createRateLimiter, DEFAULT_MAX_AUDIO_BUFFER } from "../audio/flowControl.js";
+import { canEncodeCodec, SHELL_SUPPORTED_CODECS } from "../audio/pcmEncoder.js";
+import { AmiVoiceError } from "../errorCodes.js";
 
 /**
  * `<ami-voice>` — declarative speech-recognition element.
@@ -119,6 +123,10 @@ export class AmiVoice extends HTMLElement {
     const v = this._core ? this._core.segments : this._values.segments;
     return Array.isArray(v) ? (v as RecognitionSegment[]) : [];
   }
+  get speakers(): SpeakerSegment[] {
+    const v = this._core ? this._core.speakers : this._values.speakers;
+    return Array.isArray(v) ? (v as SpeakerSegment[]) : [];
+  }
   get confidence(): number { return this._core ? this._core.confidence : Number(this._values.confidence ?? 0); }
   get loading(): boolean { return this._core ? this._core.loading : Boolean(this._values.loading); }
   get error(): WcsAmiVoiceAnyError {
@@ -154,6 +162,17 @@ export class AmiVoice extends HTMLElement {
   // relay drives the server-side Core over the proxy + binary audio channel.
   async start(): Promise<void> {
     try {
+      // The Shell physically encodes the audio, so it MUST refuse a codec it
+      // cannot produce rather than silently stream LSB16K under another label
+      // (SPEC §13, docs/adr/0005). Guard BEFORE opening any session/mic.
+      const codec = this._resolveCodec();
+      if (!canEncodeCodec(codec)) {
+        this._setError(normaliseError(new AmiVoiceError(
+          "+",
+          `codec "${codec}" is not encodable by the browser data plane; v1 supports ${SHELL_SUPPORTED_CODECS.join(", ")}`,
+        )));
+        return;
+      }
       this._ensureConnected();
       if (this._core) {
         await this._core.start();
@@ -165,6 +184,12 @@ export class AmiVoice extends HTMLElement {
     } catch (err) {
       this._setError(normaliseError(err));
     }
+  }
+
+  /** Active streaming codec: the cached `codec` input, defaulting to the Core default. */
+  private _resolveCodec(): string {
+    const c = this._inputCache.codec;
+    return c ? String(c) : "LSB16K";
   }
 
   async stop(): Promise<void> {

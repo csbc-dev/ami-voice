@@ -27,11 +27,13 @@ export { floatTo16BitPCM, downsampleTo16k } from "./audio/pcmEncoder.js";
 export { AmiVoiceError, mapResultCode, isClientError, getErrorCode } from "./errorCodes.js";
 export type { AmiVoiceErrorCode } from "./errorCodes.js";
 export { shouldSendFrame, createRateLimiter, DEFAULT_MAX_AUDIO_BUFFER } from "./audio/flowControl.js";
+// Speaker view (derived, final-only — docs/adr/0007).
+export { toSpeakerSegment, speakerLabelOf } from "./speakerView.js";
 
 export type {
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig,
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers,
-  RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult,
+  RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult, SpeakerSegment,
   AmiVoiceCodec, AmiVoiceEngine, AmiVoiceTransport, DirectSessionInfo,
   SerializedError, WcsAmiVoiceAnyError,
   AmiVoiceCoreValues, AmiVoiceValues,

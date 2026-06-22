@@ -71,6 +71,7 @@ The element declares a `static wcBindable` (protocol `"wc-bindable"`, version `1
 | `transcript` | `string` | Core | Accumulated **finalized** text (from `A` events). |
 | `interim` | `string` | Core | Current in-progress hypothesis (from `U` events). |
 | `segments` | `RecognitionSegment[]` | Core | Structured finalized history. |
+| `speakers` | `SpeakerSegment[]` | Core | Speaker-labeled finalized turns, derived from `segments`. **Final-only** (updates on `A`, never `U`) ([ADR 0007](docs/adr/0007-diarization-speaker-view.md)). |
 | `confidence` | `number` | Core | Latest finalized-segment confidence. **Final-only** (updates on `A`, never `U`). |
 | `loading` | `boolean` | Core | A start / file request is in flight. |
 | `error` | `Error \| SerializedError \| null` | Core/Shell | Last error (signal). |
@@ -112,8 +113,9 @@ The Core normalizes AmiVoice payloads; raw wire JSON is never exposed as public 
 - **`RecognitionToken`**: `{ written, spoken, confidence, starttime, endtime, label?, language? }`. `label` only with speaker diarization; `language` only on multilingual engines.
 - **`RecognitionSegment`** (finalized, from `A`): `{ text, confidence, starttime, endtime, tokens, utteranceid? }`.
 - **`InterimResult`** (from `U`): `{ text, tokens }` — **no** segment-level `confidence` (AmiVoice does not send one on `U`).
+- **`SpeakerSegment`** (derived, final-only — [ADR 0007](docs/adr/0007-diarization-speaker-view.md)): `{ label, text, starttime, endtime, confidence }`. One per finalized segment, in order, exposed as the `speakers` property. `label` is the segment's speaker id (the first token carrying a non-empty `label`, with `segmenterProperties="useDiarizer=1"`), or `""` when not diarized — consumers treat `""` as a single/unknown speaker and MAY group `speakers` by `label` for a per-speaker transcript. `segments[].tokens[].label` remains the source of truth; `speakers` is a convenience projection.
 
-On a finalized result the Core MUST: append the segment to `segments`, append its text to `transcript`, set `confidence` to the segment's confidence, and clear `interim`.
+On a finalized result the Core MUST: append the segment to `segments`, append its derived turn to `speakers`, append its text to `transcript`, set `confidence` to the segment's confidence, and clear `interim`.
 
 ## 9. Recognition modes
 
@@ -129,6 +131,16 @@ On a finalized result the Core MUST: append the segment to `segments`, append it
 5. `stop()` flushes (`e`), awaits the trailing final result, and tears down both channels. `abort()` tears down immediately.
 
 The Core MUST publish failures to `error` rather than rejecting `start()` (consumers bind state, not wrap calls in try/catch). On disconnect of either channel the Core MUST tear down the AmiVoice session and the paired channel.
+
+### 10.1 Upstream drop / reconnection (v1)
+
+AmiVoice's realtime endpoint has **no resume**: if the upstream WSS drops mid-stream, the in-flight utterance is lost. The v1 recovery policy is **explicit restart** (implementation-notes Q3):
+
+- On an upstream close the Core did **not** initiate (i.e. not a `stop()`/`abort()`/disconnect teardown), the Core MUST publish an `error` (normalized `code: "upstream"`) and set `connected = false` (and `recognizing = false`). It MUST require the consumer to call `start()` again to resume — it MUST NOT auto-reconnect in v1.
+- Already-**finalized** state MUST be preserved across the drop: `transcript`, `segments`, and `confidence` MUST NOT be cleared by the teardown (only `interim` is in-flight and may be dropped). A subsequent `start()` continues appending to the existing `transcript`.
+- A teardown the Core initiated (`stop()` graceful close, `abort()`, or a lost-`e`-ack fallback settle — §18) MUST NOT be surfaced as an `error`.
+
+Auto-reconnect (re-opening the upstream and re-sending `s` while keeping the browser session) is a deferred enhancement; if added it MUST still never silently drop finalized `transcript`.
 
 ## 11. Transport contract
 
@@ -166,7 +178,9 @@ The command builder (`buildStartCommand`) and event parser (`parseEvent`) are im
 
 ## 13. Audio format / codec contract
 
-The streaming `audio_format` (the `codec` input) is a **Core decision** ([ADR 0005](docs/adr/0005-audio-capture-and-codec-ownership.md)). The Shell encodes to whatever the Core declared and MUST NOT independently choose a format. The default is `LSB16K` (16 kHz, 16-bit signed PCM, little-endian). Supported headerless identifiers: `LSB8K…LSB48K` / `MSB8K…MSB48K`, `MULAW`, `ALAW` (case-insensitive). **ADPCM is not supported** for the realtime `audio_format`. The streamed bytes MUST match the format declared to AmiVoice in `s`. Capture, downsampling, PCM framing, and `level` computation are Shell-owned; upsampling is refused.
+The streaming `audio_format` (the `codec` input) is a **Core decision** ([ADR 0005](docs/adr/0005-audio-capture-and-codec-ownership.md)). The Shell encodes to whatever the Core declared and MUST NOT independently choose a format. The default is `LSB16K` (16 kHz, 16-bit signed PCM, little-endian). AmiVoice itself accepts the headerless identifiers `LSB8K…LSB48K` / `MSB8K…MSB48K`, `MULAW`, `ALAW` (case-insensitive); **ADPCM is not supported** for the realtime `audio_format`. The streamed bytes MUST match the format declared to AmiVoice in `s`. Capture, downsampling, PCM framing, and `level` computation are Shell-owned; upsampling is refused.
+
+**v1 Shell encoder scope.** The browser data plane physically produces only **`LSB16K`** in v1 (implementation-notes Q9); `8K` / `MULAW` / `ALAW` await a telephony requirement. Because the Shell is what emits the bytes, it MUST **reject** a `codec` it cannot encode — `start()` publishes an `error` (normalized `unsupported-format`) and does not open a session — rather than silently stream `LSB16K` under a different `audio_format` label (which would desync the bytes from the `s` declaration). When telephony codecs are added, the Shell's encodable set (`canEncodeCodec`) widens accordingly; the rejection rule stays.
 
 ## 14. Security invariants
 
@@ -175,6 +189,19 @@ The streaming `audio_format` (the `codec` input) is a **Core decision** ([ADR 00
 3. **Auth before the shell.** `@wc-bindable/remote` is a protocol layer, not a security boundary. Peer authentication and per-command authorization MUST be enforced before any control message reaches the shell handler, and before any audio frame is accepted.
 4. **Channel correlation is a trust boundary.** The audio channel MUST be bound to an authenticated session; a peer MUST NOT attach audio to another peer's session id.
 5. **Browser-direct is conditional.** A future browser-direct mode is permitted only with a short-lived / one-time credential, never the permanent APPKEY.
+
+### Deployment security profile (operator checklist)
+
+`createAmiVoiceRelayServer` provides the relay/mint plumbing but is **not** a security boundary by itself (invariant 3). A production deployment MUST add, in front of it:
+
+1. **Authenticate the peer before the shell.** Authenticate the control WebSocket (session cookie, bearer token in the handshake, mTLS, …) **before** calling `handleControlConnection`. `@wc-bindable/remote` carries no auth; an unauthenticated control peer is an unauthenticated Core.
+2. **Authorize per command/tenant.** If different peers may use different engines/grammars/profiles or have quotas, enforce that policy before/around the shell — the bindable `inputs` are client-writable, so authorization cannot live in the browser.
+3. **Bind the audio channel to the authenticated session.** Pass the audio session token via `Sec-WebSocket-Protocol` (never a query string — §11.3); `handleAudioConnection` rejects tokens with no live session, but the operator MUST ensure the audio peer is the same authenticated principal as the control peer (a token is a bearer — treat it as one).
+4. **Rate-limit and bound resources.** Cap control-message rate and the `JsonValue` payload sizes a peer can send (oversized `profileWords` / `segmenterProperties`, message floods), and cap concurrent sessions per principal. Audio back-pressure is handled Shell-side (§11.2 / Q10) but the server SHOULD bound per-connection audio throughput too.
+5. **Direct mode mint.** In `transport: "direct"`, pass the peer address so the one-time APPKEY is `ipa`-restricted; validate the mint request against the authorized policy (Core authority is advisory in direct mode — §11.4).
+6. **Observe.** Wire the injectable `logger` (Phase 3.5) to your log pipeline for connection open/close, rejected audio frames, and emitted errors. The log records never contain the APPKEY, the audio token, or wire payloads — keep it that way if you wrap them.
+
+The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of these as an `authenticatePeer` / `authorize` seam.
 
 ## 15. Core responsibilities
 
@@ -247,5 +274,10 @@ The streaming `audio_format` (the `codec` input) is a **Core decision** ([ADR 00
 | Error-code normalization | Implemented + tested (`src/errorCodes.ts`) |
 | **Browser-direct mode** (ADR 0006) | **Implemented + tested** — `transport="direct"`; shared `runRealtimeSession`, browser `DirectBrowserProvider`, server mint route with `ipa` binding; Node + real-browser Playwright |
 | Integration harness | Implemented + green — Node full-stack (`test:integration`, relay + direct) + real-browser Playwright (`test:e2e`, relay + direct) against a fake AmiVoice WSS |
+| Upstream-drop policy (§10.1) | Implemented + tested — unsolicited close → `error` (`upstream`) + `connected=false`, finalized `transcript` preserved, explicit restart (`runRealtimeSession`, Q3) |
+| Speaker view (§7.1/§8, ADR 0007) | Implemented + tested — derived final-only `speakers` property (`src/speakerView.ts`) |
+| Codec rejection (§13) | Implemented + tested — Shell refuses a `codec` it cannot encode (v1: `LSB16K` only); `8K`/`MULAW`/`ALAW` out of scope (Q9) |
+| Structured logging (§14) | Implemented + tested — injectable `logger` on `createAmiVoiceRelayServer` (open/close, rejected audio, emitted errors; no secrets) |
+| Coverage gate | Implemented — `npm run test:coverage` over the portable logic layer |
 
-Both transports are implemented and verified end to end in Node and a real browser. **Relay**: browser mic data plane → control proxy → Core → provider WSS loop; binary audio over a `Sec-WebSocket-Protocol`-correlated channel → server helper → `feedAudio`. **Direct** (docs/adr/0006): the control proxy mints (one-time APPKEY + approved `s`); the browser opens the AmiVoice WSS itself and streams audio direct, reusing the shared `runRealtimeSession` loop — the permanent APPKEY never leaves the server and the bindable surface is byte-identical. What remains is a real-AmiVoice smoke run (gated behind `AMIVOICE_APPKEY`) and the Phase 3 tuning decisions tracked in [docs/implementation-notes.md](docs/implementation-notes.md).
+Both transports are implemented and verified end to end in Node and a real browser, and the Phase 3 hardening is in place. **Relay**: browser mic data plane → control proxy → Core → provider WSS loop; binary audio over a `Sec-WebSocket-Protocol`-correlated channel → server helper → `feedAudio`. **Direct** (docs/adr/0006): the control proxy mints (one-time APPKEY + approved `s`); the browser opens the AmiVoice WSS itself and streams audio direct, reusing the shared `runRealtimeSession` loop — the permanent APPKEY never leaves the server and the bindable surface is byte-identical. What remains is a real-AmiVoice smoke run (gated behind `AMIVOICE_APPKEY`) and the user-driven release (version bump + `npm publish`). Resolved/remaining tuning decisions are tracked in [docs/implementation-notes.md](docs/implementation-notes.md).

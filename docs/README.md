@@ -24,6 +24,7 @@ Each ADR records one design decision, its context, the alternatives weighed, and
 | [0004](adr/0004-bindable-surface.md) | Bindable surface — single authority parent, `transcript`/`interim` split, projection-only children | Accepted (design intent) |
 | [0005](adr/0005-audio-capture-and-codec-ownership.md) | Audio capture & codec ownership — Shell-owned framing, Core-owned codec policy | Accepted (design intent) |
 | [0006](adr/0006-transport-baseline-after-one-time-appkey.md) | Dual-mode transport — relay default + browser-direct opt-in (one-time APPKEY confirmed); server-helper shape | Accepted (design intent) — amends 0003 |
+| [0007](adr/0007-diarization-speaker-view.md) | Surface speaker diarization as a derived, final-only `speakers` property (resolves Q6) | Accepted (design intent) — extends 0004 |
 
 ## How to add a new ADR
 

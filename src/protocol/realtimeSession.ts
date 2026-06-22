@@ -52,13 +52,24 @@ export function runRealtimeSession(
   stopTimeoutMs: number,
 ): Promise<IRealtimeSession> {
   let started = false;
+  // Set by stop()/abort() so a teardown WE initiated is not misreported as an
+  // upstream drop (Phase 3.1 / implementation-notes Q3).
+  let intentionalClose = false;
   let onEAck: (() => void) | null = null;
 
   const ready = new Promise<void>((resolve, reject) => {
     socket.onopen = () => socket.send(startCommand);
     socket.onclose = () => {
-      if (!started) reject(new AmiVoiceError("!", "AmiVoice connection closed before start"));
-      else handlers.onClose();
+      if (!started) { reject(new AmiVoiceError("!", "AmiVoice connection closed before start")); return; }
+      // After the session is up, a close we did NOT initiate is an upstream drop
+      // mid-stream. AmiVoice has no resume (implementation-notes Q3), so v1 policy
+      // is: surface it as an `error` + `connected=false` and require an explicit
+      // `start()` to resume — never auto-reconnect, never silently drop already-
+      // finalized `transcript` (the Core's teardown preserves it). SPEC §10.
+      if (!intentionalClose) {
+        handlers.onError(new AmiVoiceError("<", "AmiVoice connection lost mid-session"));
+      }
+      handlers.onClose();
     };
     socket.onerror = (err) => {
       const e = err instanceof Error ? err : new AmiVoiceError("!", "AmiVoice socket error");
@@ -102,6 +113,10 @@ export function runRealtimeSession(
     },
     stop: (): Promise<void> => new Promise<void>((resolve) => {
       let done = false;
+      // A graceful stop is consumer-initiated teardown: mark it before the `e`
+      // flush so a close during/after the flush is not reported as an upstream
+      // drop (3.1). On a lost `e` ack the fallback timer still settles us.
+      intentionalClose = true;
       const finish = (): void => {
         if (done) return;
         done = true;
@@ -113,6 +128,6 @@ export function runRealtimeSession(
       const timer = setTimeout(finish, stopTimeoutMs);
       socket.send("e");
     }),
-    abort: (): void => { socket.close(); },
+    abort: (): void => { intentionalClose = true; socket.close(); },
   }));
 }

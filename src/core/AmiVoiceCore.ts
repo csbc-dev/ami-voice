@@ -4,10 +4,11 @@ import {
 } from "../types.js";
 import type {
   WcsAmiVoiceAnyError, AmiVoiceCodec, AmiVoiceEngine,
-  AmiVoiceTransport, DirectSessionInfo,
+  AmiVoiceTransport, DirectSessionInfo, SpeakerSegment,
 } from "../types.js";
 import { normaliseError } from "../normaliseError.js";
 import { AmiVoiceError } from "../errorCodes.js";
+import { toSpeakerSegment } from "../speakerView.js";
 
 /** Observable outputs Core publishes, paired with `ami-voice:<name>-changed`. */
 const CORE_PROPERTY_NAMES = [
@@ -16,6 +17,8 @@ const CORE_PROPERTY_NAMES = [
   "transcript",
   "interim",
   "segments",
+  // `speakers` is a derived, final-only projection of `segments` (docs/adr/0007).
+  "speakers",
   "confidence",
   "loading",
 ] as const;
@@ -109,6 +112,7 @@ export class AmiVoiceCore extends EventTarget {
   private _transcript = "";
   private _interim = "";
   private _segments: RecognitionSegment[] = [];
+  private _speakers: SpeakerSegment[] = [];
   private _confidence = 0;
   private _loading = false;
   private _error: WcsAmiVoiceAnyError = null;
@@ -165,6 +169,7 @@ export class AmiVoiceCore extends EventTarget {
   get transcript(): string { return this._transcript; }
   get interim(): string { return this._interim; }
   get segments(): RecognitionSegment[] { return this._segments; }
+  get speakers(): SpeakerSegment[] { return this._speakers; }
   get confidence(): number { return this._confidence; }
   get loading(): boolean { return this._loading; }
   get error(): WcsAmiVoiceAnyError { return this._error; }
@@ -174,6 +179,7 @@ export class AmiVoiceCore extends EventTarget {
   private _setTranscript(v: string): void { if (this._transcript !== v) { this._transcript = v; this._emit("transcript", v); } }
   private _setInterim(v: string): void { if (this._interim !== v) { this._interim = v; this._emit("interim", v); } }
   private _setSegments(v: RecognitionSegment[]): void { this._segments = v; this._emit("segments", v); }
+  private _setSpeakers(v: SpeakerSegment[]): void { this._speakers = v; this._emit("speakers", v); }
   private _setConfidence(v: number): void { if (this._confidence !== v) { this._confidence = v; this._emit("confidence", v); } }
   private _setLoading(v: boolean): void { if (this._loading !== v) { this._loading = v; this._emit("loading", v); } }
   private _setError(v: WcsAmiVoiceAnyError): void { this._error = v; this._emit("error", v); }
@@ -205,6 +211,8 @@ export class AmiVoiceCore extends EventTarget {
 
   private _appendFinal(segment: RecognitionSegment): void {
     this._setSegments([...this._segments, segment]);
+    // `speakers` is the derived, final-only speaker view (docs/adr/0007).
+    this._setSpeakers([...this._speakers, toSpeakerSegment(segment)]);
     this._setTranscript(this._transcript + segment.text);
     this._setConfidence(segment.confidence);
     this._setInterim("");
@@ -282,6 +290,7 @@ export class AmiVoiceCore extends EventTarget {
     this._setTranscript("");
     this._setInterim("");
     this._setSegments([]);
+    this._setSpeakers([]);
     this._setConfidence(0);
     this._setError(null);
   }

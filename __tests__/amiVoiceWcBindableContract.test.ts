@@ -67,6 +67,8 @@ describe("AmiVoice wcBindable contract", () => {
     const byName = new Map(AmiVoice.wcBindable.properties.map((p) => [p.name, p.event]));
     expect(byName.get("transcript")).toBe("ami-voice:transcript-changed");
     expect(byName.get("recognizing")).toBe("ami-voice:recognizing-changed");
+    // `speakers` is a normal state transition (derived, final-only — ADR 0007).
+    expect(byName.get("speakers")).toBe("ami-voice:speakers-changed");
     // `error` is a signal, not a state transition — no `-changed` suffix.
     expect(byName.get("error")).toBe("ami-voice:error");
   });

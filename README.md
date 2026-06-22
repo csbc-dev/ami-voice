@@ -20,7 +20,7 @@ npm install @csbc-dev/ami-voice
 
 ```bash
 npm run build && AMIVOICE_APPKEY=your-key npm run example
-# control: ws://localhost:3100/   audio: ws://localhost:3101/
+# single port: control + audio both on ws://localhost:3100/ (routed by Sec-WebSocket-Protocol)
 ```
 
 The server wires `@csbc-dev/ami-voice/server`'s `createAmiVoiceRelayServer` to your WebSocket server. **You MUST authenticate the peer before handing sockets to the relay** (see [SPEC.md §14](SPEC.md)).
@@ -54,12 +54,15 @@ Any framework adapter from the `@wc-bindable/*` family (React, Vue, Svelte, …)
 | `transcript` | accumulated **finalized** text |
 | `interim` | current in-progress hypothesis |
 | `segments` | structured finalized history (text + confidence + token timings) |
+| `speakers` | speaker-labeled finalized turns (derived from `segments`; group by `label` for a per-speaker transcript — needs `segmenterProperties="useDiarizer=1"`) |
 | `confidence` | latest finalized-segment confidence (final-only) |
 | `level` | mic input level (for a meter) |
 | `loading` / `error` | request in flight / last error |
 
 **Inputs**: `engine`, `codec`, `profileId`, `profileWords`, `keepFillerToken`, `resultUpdatedInterval`, `segmenterProperties`, `noLog`.
 **Commands**: `start()`, `stop()` (graceful), `abort()` (immediate), `reset()`.
+
+> **Codec scope (v1):** the browser streams **`LSB16K`** (16 kHz PCM) only. Setting `codec` to a format the data plane can't encode (`8K` / `MULAW` / `ALAW`, telephony — not yet supported) is **rejected on `start()`** (an `unsupported-format` error) rather than silently downgraded. **Diarization:** set `segmenterProperties="useDiarizer=1"` to populate `speakers`.
 
 Full contract: [SPEC.md §7](SPEC.md).
 
@@ -97,7 +100,29 @@ The recognition surface (`transcript` / `interim` / `start` / …) is **byte-ide
 ## Security
 
 - The **APPKEY stays on the server** (`AMIVOICE_APPKEY`); it is never an attribute, never in the bundle, never on the wire to the browser.
-- `@wc-bindable/remote` is a protocol layer, **not** a security boundary — authenticate the peer and authorize commands **before** the relay handlers (and pass the audio session token via `Sec-WebSocket-Protocol`). See [SPEC.md §14](SPEC.md) and [ADR 0002](docs/adr/0002-appkey-residency-and-remote-first.md).
+- `createAmiVoiceRelayServer` is plumbing, **not** a security boundary. Put a deployment security profile in front of it ([SPEC.md §14](SPEC.md), [ADR 0002](docs/adr/0002-appkey-residency-and-remote-first.md)):
+
+  1. **Authenticate the peer before the shell** — auth the control WebSocket (cookie / bearer / mTLS) *before* `handleControlConnection`. `@wc-bindable/remote` carries no auth.
+  2. **Authorize per command/tenant** — engine/grammar/profile/quota policy lives server-side; the bindable `inputs` are client-writable.
+  3. **Bind audio to the authenticated session** — the audio token rides `Sec-WebSocket-Protocol` (never a query string); ensure the audio peer is the same principal as the control peer.
+  4. **Rate-limit & bound resources** — cap message rate, `JsonValue` payload sizes, and concurrent sessions per principal.
+  5. **Direct mode** — pass `peerAddress` so the one-time key is `ipa`-restricted, and validate the mint request (Core authority is advisory in direct mode).
+  6. **Observe** — wire the injectable `logger` (below) to your log pipeline.
+
+The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each as an `authenticatePeer` / `authorize` seam.
+
+### Structured logging
+
+`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and emitted Core errors. Records never contain the APPKEY, the audio token, or wire payloads.
+
+```js
+createAmiVoiceRelayServer({
+  logger: (e) => console.log(JSON.stringify({ at: "ami-voice", ...e })),
+  // e.g. { type: "control-open", transport: "relay", peerAddress }
+  //      { type: "audio-rejected", reason: "unknown-session" }
+  //      { type: "error", code: "upstream", message }
+});
+```
 
 ## Package entry points
 
@@ -113,6 +138,7 @@ The recognition surface (`transcript` / `interim` / `start` / …) is **byte-ide
 ```bash
 npm run build            # tsc → dist/
 npm test                 # unit suite (happy-dom)
+npm run test:coverage    # unit suite + coverage gate over the portable logic layer
 npm run test:integration # full relay loop over real sockets (Node)
 npm run test:e2e         # real-browser relay e2e (Playwright + system Chrome, fake mic)
 npm run example          # runnable relay server (fake AmiVoice without a key)

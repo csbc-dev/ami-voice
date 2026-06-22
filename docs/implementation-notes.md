@@ -18,7 +18,7 @@ Each open question is stated as: **Context → Options → Lean (current recomme
 | ~~Mic capture runtime~~ | `MicCapture` | ✅ **Covered** — exercised by the Playwright e2e (`tests/browser/relay.browser.spec.ts`) with a Chromium fake audio device. | done |
 | ~~Integration harness~~ | `tests/integration` + `tests/browser` | ✅ **Done** — Node full-stack (`test:integration`) + real-browser Playwright (`test:e2e`) against the fake AmiVoice WSS. | done |
 | Real-AmiVoice run | provider | Needs a paid APPKEY; gated behind `AMIVOICE_APPKEY` | A smoke run against `wss://acp-api.amivoice.com/v1/` |
-| Tuning | various | upstream reconnect (Q3) remains open; `level` throttle (Q5), audio backpressure (Q10), graceful-stop (Q4/D1) are wired | Q3 decided + wired against the real transport |
+| Tuning | various | ✅ upstream reconnect (Q3), `level` throttle (Q5), audio backpressure (Q10), graceful-stop (Q4/D1) all wired | re-tune against the real transport during the smoke run |
 
 ---
 
@@ -55,7 +55,7 @@ Each open question is stated as: **Context → Options → Lean (current recomme
 
 **Lean.** (a) for v1 — explicit, debuggable, no hidden state. Auto-reconnect is a later enhancement and MUST NOT silently drop finalized text already in `transcript`.
 
-**Blocker.** None; just needs to be decided and written into SPEC §10.
+**Resolved (Phase 3).** Implemented as the lean (a). `runRealtimeSession` tracks an `intentionalClose` flag set by `stop()`/`abort()`/the lost-`e`-ack fallback; an upstream close with that flag unset is a mid-session drop → `handlers.onError(AmiVoiceError "<" → "upstream")` + `onClose`, so the Core publishes `error` and sets `connected = false`/`recognizing = false` while the teardown preserves `transcript`/`segments`/`confidence`. A consumer resumes by calling `start()` again. Written into SPEC §10.1; tested in `__tests__/realtimeSession.test.ts`.
 
 ### Q4 — Graceful `stop()`: how long to wait for the trailing final result
 
@@ -85,7 +85,7 @@ Each open question is stated as: **Context → Options → Lean (current recomme
 
 **Lean.** (a) for v1 — keep the data on tokens, no new top-level property. Revisit a child projection tag (per [ADR 0004](0004-bindable-surface.md)) if a diarized-transcript UI is needed.
 
-**Blocker.** Product requirement — is diarization a v1 use case?
+**Resolved (Phase 3, [ADR 0007](0007-diarization-speaker-view.md)).** Product input confirmed a speaker view is in scope, so Q6 resolves toward option (b): a **derived, final-only `speakers` property** — one labeled turn (`{ label, text, starttime, endtime, confidence }`) per finalized segment, `label` from the segment's first labeled token (`""` when undiarized). `segments[].tokens[].label` stays the source of truth; `language` stays on tokens. Implemented in `src/speakerView.ts`; SPEC §7.1/§8; tested.
 
 ### Q7 — Error taxonomy: AmiVoice errors → normalized codes
 
@@ -115,7 +115,7 @@ Each open question is stated as: **Context → Options → Lean (current recomme
 
 **Lean.** `LSB16K` only for v1 (covers the 16 kHz engines). Add `8K` + `MULAW`/`ALAW` when a telephony use case appears. The Shell MUST reject a `codec` it cannot encode rather than silently send `LSB16K`.
 
-**Blocker.** Telephony (8 kHz) requirement.
+**Resolved (Phase 3, deferred).** Telephony is not in v1 scope, so `8K`/`MULAW`/`ALAW` are **not** added — but the rejection rule is now enforced: `canEncodeCodec` (`src/audio/pcmEncoder.ts`) gates the Shell's `start()`, which publishes an `unsupported-format` error and opens no session for any `codec` the v1 data plane can't encode (everything but `LSB16K`). When telephony lands, widen `SHELL_SUPPORTED_CODECS` + the encoder; the rejection rule stays. SPEC §13; tested.
 
 ### Q10 — Audio backpressure / flow control
 

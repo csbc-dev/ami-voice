@@ -14,10 +14,11 @@
 // Without AMIVOICE_APPKEY it talks to an in-process FAKE AmiVoice (so it runs
 // with no credentials). Set AMIVOICE_APPKEY to point at the real endpoint.
 //
-// ⚠ AUTH IS A PLACEHOLDER. SPEC §14 / ADR 0002: a real deployment MUST
-//   authenticate the peer BEFORE handing the socket to the relay handlers, and
-//   the audio token (subprotocol) only proves session ownership because the
-//   control peer was authenticated.
+// ⚠ AUTH IS A SEAM, NOT A DEFAULT. SPEC §14 "Deployment security profile": a real
+//   deployment authenticates the peer in `authenticatePeer()` and enforces policy
+//   in `authorize()` BEFORE the relay handlers (this demo accepts everyone so it
+//   runs offline). The audio token (subprotocol) only proves session ownership
+//   because the control peer was authenticated. See the SECURITY SEAM block below.
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
 import { WebSocketServerTransport } from "@wc-bindable/remote";
@@ -65,7 +66,31 @@ const relay = createAmiVoiceRelayServer({
     realtimeNoLogEndpoint,
     socketFactory: wsSocketFactory,
   }),
+  // (3.5) Structured logging — connection open/close, rejected audio, emitted
+  // errors. Records never carry the APPKEY, the audio token, or wire payloads.
+  logger: (e) => console.log("[ami-voice]", JSON.stringify(e)),
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECURITY SEAM (SPEC §14 "Deployment security profile"). `@wc-bindable/remote`
+// is NOT a security boundary. A real deployment authenticates the peer HERE,
+// before any socket reaches the relay handlers, and authorizes what it may do.
+//
+//   - authenticatePeer(req): resolve the principal from the handshake (session
+//     cookie / bearer header / mTLS). Return null to reject the connection.
+//   - authorize(principal, ...): enforce engine/grammar/profile/quota policy
+//     (the bindable inputs are client-writable, so this CANNOT live in the page).
+//
+// This demo accepts everyone (no credentials) so `npm run example` runs offline.
+// Replace the body — the call sites are already wired.
+function authenticatePeer(req) {
+  // e.g. verify req.headers.cookie / a bearer token / a signed query nonce.
+  return { id: "demo-anon", remoteAddress: req.socket.remoteAddress };
+}
+function authorize(_principal /*, engine, profileId, … */) {
+  return true; // e.g. check tenant quota / allowed engines here.
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const sessions = new Map();
 const wss = new WebSocketServer({
@@ -74,17 +99,27 @@ const wss = new WebSocketServer({
   // handshake (SPEC §11.3). Control connections offer none → not called.
   handleProtocols: (protocols) => [...protocols][0] ?? false,
 });
-wss.on("connection", (sock) => {
+wss.on("connection", (sock, req) => {
+  const principal = authenticatePeer(req);
+  if (!principal) { sock.close(1008, "unauthenticated"); return; }
+
   if (sock.protocol) {
-    // Audio connection: subprotocol carries the session token.
-    // TODO(auth): the token proves session ownership only because the control
-    // peer was authenticated — verify the peer too.
+    // Audio connection: the subprotocol carries the session token. The relay
+    // rejects any token with no live session. PRODUCTION: also verify this audio
+    // peer is the SAME principal that opened the control session the token
+    // belongs to (SPEC §14 — bind audio to the authenticated session); track the
+    // token returned to the browser over the control channel in your own
+    // registry and compare it to `principal.id` here.
     relay.handleAudioConnection(sock, sock.protocol);
     return;
   }
+
   // Control connection: @wc-bindable/remote JSON proxy.
-  // TODO(auth): authenticate `sock` here before handing it to the relay.
-  const session = relay.handleControlConnection(new WebSocketServerTransport(sock));
+  if (!authorize(principal)) { sock.close(1008, "forbidden"); return; }
+  const session = relay.handleControlConnection(
+    new WebSocketServerTransport(sock),
+    { peerAddress: req.socket.remoteAddress },
+  );
   sessions.set(sock, session);
   sock.on("close", () => { session.dispose(); sessions.delete(sock); });
 });

@@ -3,5 +3,6 @@ dist
 packages
 test-results
 playwright-report
+coverage
 *.tsbuildinfo
 .claude/settings.local.json

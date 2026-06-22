@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>ami-voice relay e2e</title>
+  <!--
+    The built bundle (`/dist/index.js`) imports the wc-bindable packages by bare
+    specifier. The browser has no bundler, so an import map points those at the
+    ESM served under `/vendor/` by the harness server.
+  -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@wc-bindable/core": "/vendor/core/index.js",
+      "@wc-bindable/remote": "/vendor/remote/index.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <h1>ami-voice relay e2e</h1>
+  <button id="start">start</button>
+  <button id="stop">stop</button>
+  <!-- State mirrored here so Playwright asserts on observable DOM. -->
+  <output id="interim"></output>
+  <output id="transcript"></output>
+  <output id="error"></output>
+  <div id="status" data-connected="false" data-recognizing="false"></div>
+
+  <script type="module">
+    import { bootstrapAmiVoice } from "/dist/index.js";
+
+    // Configure + register <ami-voice> once, before connect (CLAUDE.md rule).
+    bootstrapAmiVoice();
+
+    const out = (id) => document.getElementById(id);
+
+    // Build the element in script so we can derive the relay URL from the page
+    // origin (control + audio share it) and attach listeners before connect.
+    const av = document.createElement("ami-voice");
+    av.id = "av";
+    av.setAttribute("remote-url", `ws://${location.host}/`);
+    av.setAttribute("engine", "-a-general");
+    av.setAttribute("codec", "LSB16K");
+
+    av.addEventListener("ami-voice:interim-changed", (e) => { out("interim").textContent = e.detail ?? ""; });
+    av.addEventListener("ami-voice:transcript-changed", (e) => { out("transcript").textContent = e.detail ?? ""; });
+    av.addEventListener("ami-voice:connected-changed", (e) => { out("status").dataset.connected = String(e.detail); });
+    av.addEventListener("ami-voice:recognizing-changed", (e) => { out("status").dataset.recognizing = String(e.detail); });
+    av.addEventListener("ami-voice:error", (e) => {
+      // `error` is a bindable property, so the initial bind() sync delivers a
+      // null detail ("no error"); only surface a truthy error.
+      const d = e.detail;
+      out("error").textContent = d ? String(d.message || d) : "";
+    });
+
+    document.body.appendChild(av); // connectedCallback → opens the control channel
+
+    // start()/stop() are called from a real click so getUserMedia + AudioContext
+    // get a user gesture (Chromium fake device supplies the audio).
+    out("start").addEventListener("click", () => { void av.start(); });
+    out("stop").addEventListener("click", () => { void av.stop(); });
+
+    // Expose for direct driving from page.evaluate if needed.
+    window.__av = av;
+  </script>
+</body>
+</html>

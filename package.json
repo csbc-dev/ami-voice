@@ -1,0 +1,67 @@
+{
+  "name": "@csbc-dev/ami-voice",
+  "version": "0.1.0",
+  "description": "Declarative speech-recognition component for the AmiVoice cloud API. Server-side APPKEY, browser mic capture, two-channel relay, via wc-bindable-protocol.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./auto": {
+      "types": "./src/auto/auto.d.ts",
+      "default": "./src/auto/auto.js"
+    },
+    "./auto/remoteEnv": {
+      "types": "./src/auto/remoteEnv.d.ts",
+      "default": "./src/auto/remoteEnv.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/auto",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "npm run build",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run __tests__",
+    "test:watch": "vitest __tests__",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "npm run build && playwright test",
+    "example": "node examples/relayServer.mjs"
+  },
+  "keywords": [
+    "web-components",
+    "speech-recognition",
+    "amivoice",
+    "asr",
+    "stt",
+    "custom-elements",
+    "wc-bindable",
+    "declarative"
+  ],
+  "dependencies": {
+    "@wc-bindable/core": "^0.8.0",
+    "@wc-bindable/remote": "^0.8.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "happy-dom": "^20.8.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18",
+    "ws": "^8.21.0"
+  },
+  "author": "mogera551",
+  "license": "MIT"
+}

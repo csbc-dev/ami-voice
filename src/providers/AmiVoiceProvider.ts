@@ -33,6 +33,8 @@ export interface AmiVoiceProviderOptions {
   /** Async-poll interval bounds in ms. Default 1000 → 5000 (exponential). */
   pollIntervalMs?: number;
   pollMaxIntervalMs?: number;
+  /** Async-poll overall deadline in ms; guards against a never-terminating job. Default 1_800_000 (30 min). */
+  pollTimeoutMs?: number;
   /** Injectable socket factory (default wraps platform `WebSocket`). */
   socketFactory?: (url: string) => RealtimeSocket;
   /** Injectable fetch (default platform `fetch`). */
@@ -65,6 +67,7 @@ export class AmiVoiceProvider implements IAmiVoiceProvider {
   private readonly _stopTimeoutMs: number;
   private readonly _pollIntervalMs: number;
   private readonly _pollMaxIntervalMs: number;
+  private readonly _pollTimeoutMs: number;
   private readonly _socketFactory: (url: string) => RealtimeSocket;
   private readonly _fetch: typeof fetch;
 
@@ -79,6 +82,7 @@ export class AmiVoiceProvider implements IAmiVoiceProvider {
     this._stopTimeoutMs = options.stopTimeoutMs ?? 5000;
     this._pollIntervalMs = options.pollIntervalMs ?? 1000;
     this._pollMaxIntervalMs = options.pollMaxIntervalMs ?? 5000;
+    this._pollTimeoutMs = options.pollTimeoutMs ?? 1_800_000;
     this._socketFactory = options.socketFactory ?? defaultSocketFactory;
     this._fetch = options.fetch ?? ((globalThis as { fetch?: typeof fetch }).fetch as typeof fetch);
   }
@@ -152,6 +156,7 @@ export class AmiVoiceProvider implements IAmiVoiceProvider {
   private async _pollAsyncJob(sessionid: string): Promise<RecognitionSegment[]> {
     const url = `${this._asyncEndpoint}/${encodeURIComponent(sessionid)}`;
     let interval = this._pollIntervalMs;
+    const deadline = Date.now() + this._pollTimeoutMs;
     for (;;) {
       const res = await this._fetch(url, { headers: { Authorization: `Bearer ${this._appKey}` } });
       if (!res.ok) throw new AmiVoiceError("?", `async poll failed (HTTP ${res.status})`);
@@ -163,6 +168,11 @@ export class AmiVoiceProvider implements IAmiVoiceProvider {
       };
       if (job.status === "completed") return normalizeAsyncSegments(job.segments);
       if (job.status === "error") throw new AmiVoiceError(job.code ?? "?", job.error_message ?? "async recognition failed");
+      // Bound the loop: a job stuck in queued/started/processing must not poll
+      // forever (no cancellation handle is threaded through recognizeFile).
+      if (Date.now() >= deadline) {
+        throw new AmiVoiceError("?", `async recognition did not complete within ${this._pollTimeoutMs}ms`);
+      }
       await delay(interval);
       interval = Math.min(interval * 2, this._pollMaxIntervalMs);
     }

@@ -98,6 +98,18 @@ export interface AmiVoiceRelayServer {
   sessionCount(): number;
 }
 
+/**
+ * Strip any `authorization=<token>` substring from a message before it is logged.
+ * Package-generated messages (errorCodes.ts) never carry one, but a non-ok
+ * `s`/`p`/`e` ack echoes the raw upstream string (wnnProtocol.ts), and the `s`
+ * command itself ends in `authorization=<APPKEY>`. Redacting here keeps the
+ * "never log the APPKEY" guarantee (SPEC §11.3) true regardless of what upstream
+ * reflects back.
+ */
+function redactSecrets(message: string): string {
+  return message.replace(/authorization=\S+/gi, "authorization=<redacted>");
+}
+
 function toUint8(data: unknown): Uint8Array | null {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -145,7 +157,7 @@ export function createAmiVoiceRelayServer(
       // Log emitted Core errors (normalized code + message only — never payloads).
       const onCoreError = (e: Event): void => {
         const detail = (e as CustomEvent<WcsAmiVoiceAnyError>).detail;
-        if (detail) log({ type: "error", code: getErrorCode(detail), message: detail.message });
+        if (detail) log({ type: "error", code: getErrorCode(detail), message: redactSecrets(detail.message) });
       };
       core.addEventListener("ami-voice:error", onCoreError);
       log({ type: "control-open", transport: transportMode, peerAddress: connOptions.peerAddress });

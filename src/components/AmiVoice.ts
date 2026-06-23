@@ -182,8 +182,21 @@ export class AmiVoice extends HTMLElement {
         await this._startMicRemote(session);
       }
     } catch (err) {
+      // A failure AFTER the upstream session opened — typically a getUserMedia
+      // denial or an audio-channel open error — must not strand the session as
+      // `recognizing=true` with no audio flowing. Roll the data plane and the
+      // session back (best-effort) before surfacing the original error.
+      this._rollbackStart();
       this._setError(normaliseError(err));
     }
+  }
+
+  /** Best-effort teardown of a partially-started session (see `start()`'s catch). */
+  private _rollbackStart(): void {
+    this._mic?.stop();
+    this._closeAudio();
+    if (this._core) this._core.abort();
+    else void this._proxy?.invoke("abort").catch(() => { /* rollback is best-effort */ });
   }
 
   /** Active streaming codec: the cached `codec` input, defaulting to the Core default. */
@@ -211,7 +224,13 @@ export class AmiVoice extends HTMLElement {
   }
 
   reset(): void {
-    this.abort();
+    // Tear down the Shell-owned data plane (mic + audio channel) directly, then
+    // delegate the recognition reset ONCE. The Core's reset() already aborts any
+    // live session internally, so we deliberately do not also round-trip a
+    // separate abort (the relay path would otherwise send abort + reset for a
+    // single user action).
+    this._mic?.stop();
+    this._closeAudio();
     if (this._core) this._core.reset();
     else void this._proxy?.invoke("reset").catch((e) => this._setError(normaliseError(e)));
   }
@@ -318,15 +337,11 @@ export class AmiVoice extends HTMLElement {
 
   private async _startMicRemote(session: unknown): Promise<void> {
     const sessionId = typeof session === "string" ? session : String(session ?? "");
-    try {
-      // Audio rides the SEPARATE binary channel, never the JSON proxy
-      // (docs/adr/0003). Default the audio URL to the control URL; deployments
-      // may point it elsewhere.
-      this._audioWs = openAudioChannel(this._remoteUrl || getRemoteCoreUrl(), sessionId);
-    } catch (err) {
-      this._setError(normaliseError(err));
-      return;
-    }
+    // Audio rides the SEPARATE binary channel, never the JSON proxy
+    // (docs/adr/0003). Default the audio URL to the control URL; deployments may
+    // point it elsewhere. A failure here propagates to `start()`'s catch, which
+    // rolls the just-opened upstream session back rather than leaving it stranded.
+    this._audioWs = openAudioChannel(this._remoteUrl || getRemoteCoreUrl(), sessionId);
     await this._startMic((bytes) => this._sendAudioRemote(bytes));
   }
 

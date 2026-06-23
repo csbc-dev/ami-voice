@@ -126,7 +126,16 @@ export function runRealtimeSession(
       };
       onEAck = finish; // settle when AmiVoice acks `e` (end-of-results, D1)
       const timer = setTimeout(finish, stopTimeoutMs);
-      socket.send("e");
+      // The platform WebSocket only throws from send() while CONNECTING, which is
+      // unreachable here (this stop() exists only after the `s` ack). But
+      // `RealtimeSocket` is an injectable seam, so guard defensively: if a `send`
+      // throws, treat the stop goal as already met and settle — rather than
+      // rejecting and orphaning the fallback timer.
+      try {
+        socket.send("e");
+      } catch {
+        finish();
+      }
     }),
     abort: (): void => { intentionalClose = true; socket.close(); },
   }));

@@ -22,9 +22,11 @@
 
 | ファイル | 役割 |
 |---|---|
-| [`server.mjs`](server.mjs) | 1プロセスに2つの Core を同居。`/` = `<ami-voice>` リレー、`/ai-agent` = `<ai-agent>` リモート。 |
+| [`server.mjs`](server.mjs) | 1プロセスに2つの Core を同居。WS アップグレードは `/ai-agent` のみ `<ai-agent>` リモートへ、**それ以外のパスはすべて** `<ami-voice>` リレーへルーティング（`/` を含むフォールバック）。 |
 | [`fakes.mjs`](fakes.mjs) | 鍵なしで動かすためのフェイク（AmiVoice 上流 + OpenAI 互換 SSE）。 |
 | [`src/main.ts`](src/main.ts) | ★ 配線本体。`transcript → prompt → send()` の一行ポリシー。 |
+
+> 補足: 同階層の [`zenn-draft.md`](zenn-draft.md) はこのサンプルを題材にした **記事の下書き**（`published: false`）で、サンプルの動作には関係しません。`package-lock.json` は `npm install` が生成する通常の成果物です。
 
 ## 動かす
 
@@ -76,9 +78,16 @@ function summarize() {
   aiAgent.prompt = transcript;
   aiAgent.send();
 }
-// 認識が止まったら（Stop）一度だけ呼ぶ、というのが唯一のポリシー判断
-if (prevRecognizing && !recognizing) summarize();
+// 認識が止まったら（Stop）一度だけ呼ぶ、というのが唯一のポリシー判断。
+// 実コード（main.ts）では「Stop で自動要約」チェックがオンのときだけ summarize()
+// する onSpeechStopped() を経由する（チェックを外すとボタン手動だけになる）。
+if (prevRecognizing && !recognizing) onSpeechStopped();  // = autoチェックON時のみ summarize()
 ```
+
+> 補足: この配線は「確定テキスト（`transcript`）の更新が `recognizing→false` より先に届く」という
+> Core 側の発火順に乗っているので、要約には常に最後まで確定した文字起こしが渡ります。
+> 万一その順序が崩れる環境では確定が一拍遅れて反映されうるため、`summarize()` 冒頭の
+> 空ガード（`if (!transcript.trim()) return`）が空送信だけは確実に弾きます。
 
 `getUserMedia` / `AudioWorklet` / WSS フレーミング / SSE パース / トークン蓄積 / abort /
 鍵管理 —— これらはすべて2つの Core の内側にあり、アプリ側のコードには現れません。

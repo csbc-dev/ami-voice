@@ -94,6 +94,9 @@ class ServerAiCore extends AiCore {
 }
 
 // ── HTTP: CORS, the fake-LLM SSE endpoint (offline), a landing page ─────────────
+// Wide-open CORS for the localhost demo. PRODUCTION: pin Access-Control-Allow-Origin
+// to your app origin. Note WS upgrades are NOT subject to CORS, so origin/auth for
+// the sockets must be enforced in the `upgrade` handler below, not here.
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -148,7 +151,11 @@ function authorize(_principal /*, engine, codec, provider, … */) {
 
 const amiWss = new WebSocketServer({
   noServer: true,
-  handleProtocols: (protocols) => [...protocols][0] ?? false, // audio carries the session token
+  // Two kinds of client hit this WSS. CONTROL sends no subprotocol → `protocols`
+  // is empty → `?? false` accepts it with no negotiated protocol (sock.protocol
+  // == ""). AUDIO sends the session token as its one subprotocol → we echo it
+  // back so the upgrade succeeds and sock.protocol carries the token downstream.
+  handleProtocols: (protocols) => [...protocols][0] ?? false,
 });
 const aiWss = new WebSocketServer({ noServer: true });
 
@@ -159,13 +166,15 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // <ami-voice> relay: control (no subprotocol) + audio (subprotocol = session token).
-const sessions = new Map();
 amiWss.on("connection", (sock, req) => {
   const principal = authenticatePeer(req);
   if (!principal) { sock.close(1008, "unauthenticated"); return; }
   if (sock.protocol) {
-    // Audio connection. PRODUCTION: verify this is the SAME principal that opened
-    // the control session before relaying its bytes.
+    // Audio connection. `sock.protocol` is the WS subprotocol the browser sent =
+    // the session token the control channel minted; the relay matches it to the
+    // open control session internally (that's how audio bytes find their Core).
+    // PRODUCTION: also verify this is the SAME authenticated principal that opened
+    // that control session before relaying its bytes.
     relay.handleAudioConnection(sock, sock.protocol);
     return;
   }
@@ -175,8 +184,10 @@ amiWss.on("connection", (sock, req) => {
     new WebSocketServerTransport(sock),
     { peerAddress: req.socket.remoteAddress },
   );
-  sessions.set(sock, session);
-  sock.on("close", () => { session.dispose(); sessions.delete(sock); });
+  // dispose() tears down the upstream AmiVoice WSS, the control channel, and the
+  // relay's session-token table — so the close handler captures `session` in its
+  // closure and needs no extra bookkeeping map.
+  sock.on("close", () => session.dispose());
 });
 
 // <ai-agent> remote Core: one AiCore per connection (owns history + abort state).

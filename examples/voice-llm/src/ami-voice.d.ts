@@ -2,11 +2,6 @@
 // self-contained (no cross-package type resolution needed for `vite build`).
 // An intentional per-example copy — mirrors the other examples' typings.
 
-export interface RecognitionSegment {
-  text: string;
-  confidence: number;
-}
-
 /** <ami-voice>: imperative surface + the bindable properties we read. */
 export interface AmiVoiceElement extends HTMLElement {
   start(): Promise<void>;
@@ -14,9 +9,11 @@ export interface AmiVoiceElement extends HTMLElement {
   reset(): void;
   recognizing: boolean;
   connected: boolean;
+  loading: boolean;
   transcript: string;
   interim: string;
   level: number;
+  mode: string;
   error: Error | { message?: string } | null;
 }
 
@@ -28,6 +25,7 @@ export interface AiAgentElement extends HTMLElement {
   content: string;
   loading: boolean;
   streaming: boolean;
+  usage: AiUsage | null;
   error: Error | { status?: number; body?: string; statusText?: string } | null;
 }
 

@@ -60,8 +60,18 @@ export function startFakeRealtime() {
         frames++;
         if (frames % 8 === 0 && idx < PHRASES.length) {
           const phrase = PHRASES[idx++];
-          sock.send(`U {"text":"${phrase}","results":[{"tokens":[{"written":"${phrase}"}]}]}`);
-          sock.send(`A {"text":"${phrase}","results":[{"text":"${phrase}","confidence":0.95,"starttime":${frames * 20},"endtime":${frames * 20 + 200},"tokens":[{"written":"${phrase}","spoken":"${phrase}","confidence":0.95,"starttime":0,"endtime":200}]}]}`);
+          const t = frames * 20;
+          // Build the JSON payload as an object and JSON.stringify it (rather than
+          // hand-concatenating a JSON string), then prefix the AmiVoice event
+          // command (`U ` interim / `A ` final). Safe even if a phrase ever
+          // contains a quote or backslash.
+          const uPayload = { text: phrase, results: [{ tokens: [{ written: phrase }] }] };
+          const aPayload = { text: phrase, results: [{
+            text: phrase, confidence: 0.95, starttime: t, endtime: t + 200,
+            tokens: [{ written: phrase, spoken: phrase, confidence: 0.95, starttime: 0, endtime: 200 }],
+          }] };
+          sock.send(`U ${JSON.stringify(uPayload)}`);
+          sock.send(`A ${JSON.stringify(aPayload)}`);
         }
         return;
       }
@@ -69,9 +79,15 @@ export function startFakeRealtime() {
       if (cmd === "s") sock.send("s");
       else if (cmd === "p") sock.send("p");
       else if (cmd === "e") {
-        if (idx < PHRASES.length) {
+        // On end-of-audio, flush ALL remaining phrases as finals — "Stop and the
+        // rest is committed" — so a short utterance still yields the full meeting
+        // script for the offline summary, instead of dropping un-emitted phrases.
+        while (idx < PHRASES.length) {
           const phrase = PHRASES[idx++];
-          sock.send(`A {"text":"${phrase}","results":[{"text":"${phrase}","confidence":0.9,"starttime":0,"endtime":200,"tokens":[]}]}`);
+          const aPayload = { text: phrase, results: [{
+            text: phrase, confidence: 0.9, starttime: 0, endtime: 200, tokens: [],
+          }] };
+          sock.send(`A ${JSON.stringify(aPayload)}`);
         }
         sock.send("e");
       }

@@ -25,13 +25,21 @@ bootstrapAi({
   remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: LLM_WS },
 });
 
-const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const $ = <T extends HTMLElement>(id: string): T => {
+  const el = document.getElementById(id);
+  // Fail loud if the HTML and this file drift apart (e.g. an id was renamed),
+  // instead of a confusing "cannot read appendChild of null" later.
+  if (!el) throw new Error(`#${id} not found in index.html`);
+  return el as T;
+};
 function errMsg(e: unknown): string {
   if (!e) return "";
   if (e instanceof Error) return e.message;
   if (typeof e === "object" && e) {
     const o = e as { message?: string; body?: string; statusText?: string; status?: number };
-    return String(o.message || o.body || o.statusText || (o.status ? `HTTP ${o.status}` : e));
+    // Avoid the "[object Object]" trap: if none of the known fields are present,
+    // fall back to a fixed label rather than String(o).
+    return String(o.message || o.body || o.statusText || (o.status ? `HTTP ${o.status}` : "") || "不明なエラー");
   }
   return String(e);
 }
@@ -63,13 +71,19 @@ const rtError = $("rt-error");
 let transcript = "";
 let recognizing = false;
 let connected = false;
+let loading = false;
 let prevRecognizing = false;
 
 function renderSpeechStatus() {
   toggleBtn.textContent = recognizing ? "■ Stop" : "🎤 Start";
   toggleBtn.classList.toggle("rec", recognizing);
+  // During the handshake (`loading`) the session is neither started nor stopped
+  // yet, so disable the button — this also blocks a double-tap from firing a
+  // second start()/stop() before the first resolves.
+  toggleBtn.disabled = loading;
   dotEl.classList.toggle("on", recognizing);
-  statusLabel.textContent = recognizing ? "recognizing" : connected ? "connected" : "idle";
+  statusLabel.textContent =
+    loading ? "connecting…" : recognizing ? "recognizing" : connected ? "connected" : "idle";
 }
 
 bind(ami, (name, value) => {
@@ -82,13 +96,18 @@ bind(ami, (name, value) => {
       renderSpeechStatus();
       // ★ THE WIRING ★ — when recognition stops with text, hand it to the LLM.
       // Relies on a Core ordering guarantee: stop() does `await session.stop()`
-      // (graceful `e`-flush that waits for the final `A`) BEFORE flipping
-      // recognizing→false, so the finalized `transcript` is already current when
-      // we read it here (AmiVoiceCore.stop / _teardownSession).
+      // (graceful `e`-flush that waits for the final `A`, which updates
+      // `transcript`) BEFORE flipping recognizing→false (AmiVoiceCore.stop /
+      // _teardownSession). In this relay/remote setup that Core runs server-side,
+      // so we depend on the @wc-bindable/remote control channel preserving the
+      // Core's emission order over its single WS — transcript-changed arrives
+      // before recognizing-changed:false. The empty-guard in summarize()
+      // (`if (!transcript.trim()) return`) absorbs any edge case where it doesn't.
       if (prevRecognizing && !recognizing) onSpeechStopped();
       prevRecognizing = recognizing;
       break;
     case "connected": connected = Boolean(value); renderSpeechStatus(); break;
+    case "loading": loading = Boolean(value); renderSpeechStatus(); break;
     case "error": rtError.hidden = !value; rtError.textContent = errMsg(value); break;
   }
 });
@@ -112,6 +131,9 @@ bind(aiAgent, (name, value) => {
       break;
     case "streaming":
     case "loading": {
+      // Two events feed one "busy" indicator, so we read BOTH current values off
+      // the element rather than the single `value` for whichever event fired —
+      // either one changing must recompute against the other.
       const busy = aiAgent.loading || aiAgent.streaming;
       aiDot.classList.toggle("on", busy);
       aiStatus.textContent = aiAgent.streaming ? "streaming" : aiAgent.loading ? "thinking" : "idle";
@@ -130,9 +152,21 @@ bind(aiAgent, (name, value) => {
 // ── The one policy decision: WHEN to forward transcript → prompt → send ──────────
 function summarize() {
   if (!transcript.trim()) return;
+  // Hide the previous run's token-usage line immediately. The Core also resets
+  // usage→null at send() start, so the bind() handler above would clear it anyway
+  // — but that null has to make the remote round-trip first, so we hide it here
+  // up front to avoid flashing stale counts during the handshake (redundant but
+  // harmless). content/error are overwritten by their own bind() events.
+  usageEl.hidden = true;
   // That's it. prompt is a plain property; send() runs the server-side Core.
   aiAgent.prompt = transcript;
-  void aiAgent.send().catch(() => {/* surfaced via ai-agent:error → bind above */});
+  // A failed send() normally also publishes `ai-agent:error` (handled in the bind
+  // above), so this catch is a belt-and-suspenders fallback: if a rejection ever
+  // arrives without an accompanying error event, still surface it instead of
+  // failing silently.
+  void aiAgent.send().catch((e) => {
+    if (aiError.hidden) { aiError.hidden = false; aiError.textContent = errMsg(e); }
+  });
 }
 
 function onSpeechStopped() {

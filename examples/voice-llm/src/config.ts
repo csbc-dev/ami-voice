@@ -1,5 +1,10 @@
 // The combined example server (holds BOTH secrets; hosts both Cores).
 //   npm run server   (defaults to port 3200)
+//
+// NOTE: the port below (3200) is duplicated from the server (server.mjs's
+// `PORT` default and .env.example). If you change the server's PORT, update the
+// two URLs here to match — they are separate runtimes (browser bundle vs. Node)
+// so there is no shared constant to single-source.
 export const SPEECH_WS = "ws://localhost:3200/";          // <ami-voice> relay (control + audio)
 export const LLM_WS = "ws://localhost:3200/ai-agent";     // <ai-agent> remote Core
 

@@ -32,6 +32,13 @@
          src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv" -->
   <script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
 
+  <!-- @wcstack/fetch: declarative <wcs-fetch> (buildless, from a CDN). Pinned to
+       ≥1.15.0 — that release passes File/Blob bodies straight to fetch() instead of
+       JSON-stringifying them, which is what lets <wcs-fetch> carry the audio file.
+       Loaded BEFORE @wcstack/state/auto so <wcs-fetch> is defined before <wcs-state>
+       scans its data-wcs bindings (same ordering rule as <ami-voice>'s remoteEnv). -->
+  <script type="module" src="https://esm.run/@wcstack/fetch@1.15.0/auto"></script>
+
   <!-- @wcstack/state: declarative HTML data binding (buildless, from a CDN). -->
   <script type="module" src="https://esm.run/@wcstack/state/auto"></script>
 </head>
@@ -42,22 +49,19 @@
   No build, no framework. <code>&lt;wcs-state&gt;</code> binds the <code>&lt;ami-voice&gt;</code>
   element's reactive state to the DOM with <code>data-wcs</code> path strings, and drives
   its <code>start</code> / <code>stop</code> / <code>reset</code> commands via command tokens.
+  File recognition is fully declarative too: <code>&lt;wcs-fetch&gt;</code> owns the
+  <code>/api/recognize</code> POST and its <code>value</code> / <code>loading</code> /
+  <code>error</code> bind back into state.
 </p>
 <div class="badges">
   <span class="badge">@wcstack/state</span>
   <span class="badge wc">&lt;ami-voice&gt;</span>
+  <span class="badge wc">&lt;wcs-fetch&gt;</span>
   <span class="badge">buildless</span>
 </div>
 
 <wcs-state>
   <script type="module">
-    // The picked File rides a plain module var, not a reactive slot: a binary
-    // payload doesn't belong in reactive state (the @wcstack/signals sibling makes
-    // the same call, reading its live <input> node). recognizeFile() POSTs it
-    // straight to the server. The CAPTURE is still declarative — see pickFile +
-    // the input's data-wcs="onchange: pickFile" below.
-    let pickedFile = null;
-
     export default {
       // command tokens fire <ami-voice> methods (start/stop/reset) from state.
       $commandTokens: ["startRec", "stopRec", "resetRec"],
@@ -69,9 +73,15 @@
         level: 0, segments: [], confidence: 0,
       },
 
-      // File-recognition UI state.
-      fileTranscript: "", fileSegments: [], fileError: "", fileOffline: false,
-      fileLoading: false, fileShow: false,
+      // File recognition is owned by <wcs-fetch> below — no hand-written fetch.
+      // These slots bind straight to its surface: selectedFile/fileBody/fileTrigger
+      // drive it (inputs), fileValue/fileLoading/fileError mirror it back (outputs).
+      selectedFile: null,   // what the <input> picked (drives the button's disabled state)
+      fileBody: null,       // → <wcs-fetch> body; (re)set from selectedFile on each run (raw File)
+      fileTrigger: false,   // → <wcs-fetch> trigger (false→true runs the POST)
+      fileValue: null,      // ← <wcs-fetch> value: parsed JSON {transcript, segments, speakers, offline}
+      fileLoading: false,   // ← <wcs-fetch> loading
+      fileError: null,      // ← <wcs-fetch> error (HTTP {status,statusText,body} | Error | null)
 
       get micLabel() { return this["rec.recognizing"] ? "■ Stop" : "🎤 Start"; },
       get statusLabel() {
@@ -81,6 +91,15 @@
       // 140 = meter gain: mic level (RMS ~0–0.7 for speech) → 0–100% bar width.
       get levelWidth() { return Math.min(100, Math.round(this["rec.level"] * 140)) + "%"; },
       get recognizeLabel() { return this.fileLoading ? "Recognizing…" : "Recognize"; },
+      get recognizeDisabled() { return this.fileLoading || !this.selectedFile; },
+      // <wcs-fetch> error is an object: HTTP errors carry {status, statusText, body}
+      // (the shared server puts {"error":"…"} in the body); network errors are an Error.
+      get fileErrorText() {
+        const e = this.fileError;
+        if (!e) return "";
+        if (e.body) { try { return JSON.parse(e.body).error || e.statusText; } catch { return e.body; } }
+        return e.message ?? String(e);
+      },
 
       toggle() {
         if (this["rec.recognizing"]) this.$command.stopRec.emit();
@@ -91,27 +110,16 @@
       // Declarative capture: the file <input> fires this on change (data-wcs=
       // "onchange: pickFile"). @wcstack/state calls handlers as (event, ...loopIndexes)
       // with `this` = state, so e.target is the input — no getElementById reach-in.
-      pickFile(e) { pickedFile = e.target.files?.[0] ?? null; },
+      pickFile(e) { this.selectedFile = e.target.files?.[0] ?? null; },
 
-      async recognizeFile() {
-        const file = pickedFile;
-        if (!file) return;
-        this.fileLoading = true; this.fileError = ""; this.fileShow = false;
-        try {
-          // Same origin as this page (served by the shared server) → relative URL.
-          // No codec: the async file API auto-detects the format from the file header.
-          const res = await fetch("/api/recognize?engine=-a-general", { method: "POST", body: file });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || res.statusText);
-          this.fileTranscript = data.transcript;
-          this.fileSegments = data.segments;
-          this.fileOffline = !!data.offline;
-          this.fileShow = true;
-        } catch (e) {
-          this.fileError = String(e?.message ?? e);
-        } finally {
-          this.fileLoading = false;
-        }
+      // Run the POST. <wcs-fetch> nulls its own body after each request, so (re)set
+      // fileBody from the picked file before flipping the trigger — body is declared
+      // first in the element's data-wcs, so it flushes before the trigger and the
+      // POST always carries the file. The element clears loading/error/value itself.
+      recognize() {
+        if (!this.selectedFile) return;
+        this.fileBody = this.selectedFile;
+        this.fileTrigger = true;
       },
     };
   </script>
@@ -155,29 +163,34 @@
 <!-- ── File recognition ──────────────────────────────────────────────────── -->
 <section>
   <h2>File recognition</h2>
+  <!-- <wcs-fetch> OWNS the POST now: body←the picked File, trigger fires it, and
+       value/loading/error bind straight back into state. No hand-written fetch, no
+       try/catch, no manual loading/error flags — symmetric with the realtime side. -->
+  <wcs-fetch manual method="POST" url="/api/recognize?engine=-a-general"
+    data-wcs="body: fileBody; trigger: fileTrigger; value: fileValue; loading: fileLoading; error: fileError"></wcs-fetch>
   <div class="row">
     <input type="file" accept="audio/*,.wav,.mp3,.m4a,.flac" data-wcs="onchange: pickFile" />
-    <button data-wcs="onclick: recognizeFile; disabled: fileLoading; textContent: recognizeLabel"></button>
+    <button data-wcs="onclick: recognize; disabled: recognizeDisabled; textContent: recognizeLabel"></button>
   </div>
 
-  <template data-wcs="if: fileShow">
-    <div class="transcript" data-wcs="textContent: fileTranscript"></div>
+  <template data-wcs="if: fileValue">
+    <div class="transcript" data-wcs="textContent: fileValue.transcript"></div>
     <ul class="segments">
-      <template data-wcs="for: fileSegments">
+      <template data-wcs="for: fileValue.segments">
         <li>
           <span data-wcs="textContent: .text"></span>
           <span class="seg-conf" data-wcs="textContent: .confidence|fix(2)"></span>
         </li>
       </template>
     </ul>
-    <template data-wcs="if: fileOffline">
+    <template data-wcs="if: fileValue.offline">
       <p class="muted">Offline fake result — set <code>AMIVOICE_APPKEY</code> on the server for real recognition.</p>
     </template>
   </template>
   <template data-wcs="if: fileError">
-    <div class="error" data-wcs="textContent: fileError"></div>
+    <div class="error" data-wcs="textContent: fileErrorText"></div>
   </template>
-  <p class="muted">Posts the file to <code>/api/recognize</code> (server-side recognition).</p>
+  <p class="muted">Posts the file to <code>/api/recognize</code> via <code>&lt;wcs-fetch&gt;</code> (server-side recognition).</p>
 </section>
 
 </body>

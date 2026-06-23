@@ -31,6 +31,12 @@
        /auto/remoteEnv side-effect entry reads the control URL from the global hook
        above. After publish: src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv". -->
   <script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
+
+  <!-- @wcstack/fetch ≥1.15.0 registers <wcs-fetch> (File/Blob bodies need ≥1.15 —
+       earlier versions JSON-stringify the body). It talks to signals' bindNode purely
+       through the wc-bindable protocol, so esm.run is fine here: there's no shared
+       reactive core to split across the seam (the reason @wcstack/signals is vendored). -->
+  <script type="module" src="https://esm.run/@wcstack/fetch@1.15.0/auto"></script>
 </head>
 <body>
 
@@ -39,15 +45,20 @@
   A buildless, signals-based reactive core driving real DOM with <code>h()</code>, consuming the
   <code>&lt;ami-voice&gt;</code> element through the wc-bindable adapter: <code>bindNode()</code> turns
   its reactive properties into read-only signals; <code>command()</code> drives start / stop / reset.
+  File recognition is the same story — <code>bindNode()</code> over a <code>&lt;wcs-fetch&gt;</code>
+  element turns its <code>value</code> / <code>loading</code> / <code>error</code> into signals.
 </p>
 <div class="badges">
   <span class="badge">@wcstack/signals</span>
   <span class="badge wc">&lt;ami-voice&gt;</span>
+  <span class="badge wc">&lt;wcs-fetch&gt;</span>
   <span class="badge">buildless</span>
 </div>
 
 <!-- The headless element. engine/codec are inputs; signals read its outputs. -->
 <ami-voice id="ami" engine="-a-general" codec="LSB16K"></ami-voice>
+<!-- Headless too: <wcs-fetch> owns the file POST; bindNode reads its outputs as signals. -->
+<wcs-fetch id="file-fetch" manual method="POST" url="/api/recognize?engine=-a-general"></wcs-fetch>
 
 <section>
   <h2>Realtime (relay)</h2>
@@ -73,17 +84,24 @@
   const conf = (s) => `conf ${Number(s.confidence).toFixed(2)}`;
   const segKey = (s) => s.utteranceid ?? `${s.starttime}-${s.endtime}`;
 
-  await customElements.whenDefined("ami-voice");
+  await Promise.all([
+    customElements.whenDefined("ami-voice"),
+    customElements.whenDefined("wcs-fetch"),
+  ]);
   const el = document.getElementById("ami");
   // Read the element's wc-bindable properties as read-only signals; drive its
   // commands imperatively. bindNode has no idea a relay proxy sits behind it.
   const bound = bindNode(el);
   const sig = bound.signals;
 
-  // ── File-recognition local signals (plain fetch to the shared server) ──────
-  const fileResult = signal(null);
-  const fileLoading = signal(false);
-  const fileError = signal("");
+  // ── File recognition: <wcs-fetch> owns the POST ───────────────────────────
+  // Same adapter, second element. bindNode turns the fetch element's value /
+  // loading / error into signals (value applies its declared getter → parsed JSON),
+  // and command("fetch") runs the request after we set the File body. No
+  // hand-written fetch, no try/catch — symmetric with the realtime side.
+  const fileFetch = document.getElementById("file-fetch");
+  const fbound = bindNode(fileFetch);
+  const fsig = fbound.signals;
   const hasFile = signal(false);
 
   const fileInput = h("input", {
@@ -92,21 +110,21 @@
     onChange: () => hasFile.set(!!fileInput.files?.length),
   });
 
-  async function recognizeFile() {
+  // <wcs-fetch> error is an object: HTTP errors carry {status, statusText, body}
+  // (the shared server puts {"error":"…"} in the body); network errors are an Error.
+  function fetchErrMsg(e) {
+    if (!e) return "";
+    if (e.body) { try { return JSON.parse(e.body).error || e.statusText; } catch { return e.body; } }
+    return errMsg(e);
+  }
+
+  function recognizeFile() {
     const file = fileInput.files?.[0];
     if (!file) return;
-    fileLoading.set(true); fileError.set(""); fileResult.set(null);
-    try {
-      // No codec: the async file API auto-detects the format from the file header.
-      const res = await fetch("/api/recognize?engine=-a-general", { method: "POST", body: file });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || res.statusText);
-      fileResult.set(data);
-    } catch (e) {
-      fileError.set(errMsg(e));
-    } finally {
-      fileLoading.set(false);
-    }
+    // Set the File body (sent as-is by @wcstack/fetch ≥1.15), then run the POST.
+    // Both calls are synchronous, so the body is in place before fetch() reads it.
+    fbound.set("body", file);
+    fbound.command("fetch");
   }
 
   createRoot(() => {
@@ -152,23 +170,23 @@
         h("div", { class: "row" },
           fileInput,
           h("button", {
-            disabled: () => fileLoading.get() || !hasFile.get(),
+            disabled: () => fsig.loading.get() || !hasFile.get(),
             onClick: recognizeFile,
-          }, () => (fileLoading.get() ? "Recognizing…" : "Recognize")),
+          }, () => (fsig.loading.get() ? "Recognizing…" : "Recognize")),
         ),
-        h("div", { class: "transcript", style: () => (fileResult.get() ? "" : "display:none") },
-          () => fileResult.get()?.transcript ?? ""),
+        h("div", { class: "transcript", style: () => (fsig.value.get() ? "" : "display:none") },
+          () => fsig.value.get()?.transcript ?? ""),
         h("ul", { class: "segments" },
-          For(() => fileResult.get()?.segments ?? [], (s) =>
+          For(() => fsig.value.get()?.segments ?? [], (s) =>
             h("li", null,
               h("span", null, s.text),
               h("span", { class: "seg-conf" }, conf(s)),
             ), { key: segKey }),
         ),
-        h("p", { class: "muted", style: () => (fileResult.get()?.offline ? "" : "display:none") },
+        h("p", { class: "muted", style: () => (fsig.value.get()?.offline ? "" : "display:none") },
           "Offline fake result — set AMIVOICE_APPKEY on the server for real recognition."),
-        h("div", { class: "error", style: () => (fileError.get() ? "" : "display:none") },
-          () => fileError.get()),
+        h("div", { class: "error", style: () => (fetchErrMsg(fsig.error.get()) ? "" : "display:none") },
+          () => fetchErrMsg(fsig.error.get())),
       ),
       document.getElementById("file-app"),
     );

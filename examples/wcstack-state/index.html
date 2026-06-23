@@ -10,27 +10,13 @@
        so it runs BEFORE the deferred module that reads it. -->
   <script>globalThis.AMIVOICE_REMOTE_CORE_URL = `ws://${location.host}/`;</script>
 
-  <!-- <ami-voice> is served by THIS server (the package is unpublished pre-release,
-       so esm.run can't serve it yet). Its only bare imports — @wc-bindable/core /
-       @wc-bindable/remote — map to a CDN. AFTER `npm publish`, this whole block can
-       become a single esm.run entry and /vendor goes away:
-         "@csbc-dev/ami-voice": "https://esm.run/@csbc-dev/ami-voice"
-       (esm.run resolves the @wc-bindable deps itself). -->
-  <script type="importmap">
-  {
-    "imports": {
-      "@wc-bindable/core": "https://esm.run/@wc-bindable/core@0.8.0",
-      "@wc-bindable/remote": "https://esm.run/@wc-bindable/remote@0.8.0"
-    }
-  }
-  </script>
-
   <!-- Register <ami-voice> in remote/relay mode with NO hand-written bootstrap: the
        /auto/remoteEnv side-effect entry reads the control URL from the global hook
-       above (remoteSettingType:"env"). Loaded BEFORE @wcstack/state/auto so the
-       element is defined before <wcs-state> scans its data-wcs bindings. After publish:
-         src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv" -->
-  <script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
+       above (remoteSettingType:"env"). Loaded from esm.run, which resolves the
+       package's own @wc-bindable deps — so this page needs no importmap. Loaded
+       BEFORE @wcstack/state/auto so the element is defined before <wcs-state> scans
+       its data-wcs bindings. -->
+  <script type="module" src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv"></script>
 
   <!-- @wcstack/fetch: declarative <wcs-fetch> (buildless, from a CDN). Pinned to
        ≥1.15.0 — that release passes File/Blob bodies straight to fetch() instead of

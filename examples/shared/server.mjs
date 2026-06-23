@@ -19,8 +19,10 @@
 //     The <ami-voice> element exposes only start/stop/abort/reset and the remote
 //     wire is JSON-only, so file bytes go server-side over HTTP — never the element.
 //
-//   • Static hosting for the two buildless examples (@wcstack/state, signals)
-//     and the built package (served at /vendor/ami-voice/ for those pages).
+//   • Static hosting for the two buildless examples (@wcstack/state, signals).
+//     Those pages load <ami-voice> itself from esm.run; the only thing served from
+//     here is @wcstack/signals' built core (at /vendor/signals/), kept local so its
+//     `.` and `/dom` entries share ONE reactive core instance.
 //
 // THE APPKEY NEVER LEAVES THIS PROCESS. Without AMIVOICE_APPKEY it talks to an
 // in-process FAKE AmiVoice so everything runs offline. Set AMIVOICE_APPKEY to
@@ -40,8 +42,6 @@ import { wsSocketFactory, startFakeRealtime, fakeRecognizeFile } from "./fakeAmi
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const EXAMPLES_DIR = join(__dirname, "..");        // examples/
-const PACKAGE_DIR = join(EXAMPLES_DIR, "..");      // repo root
-const DIST_DIR = join(PACKAGE_DIR, "dist");
 // @wcstack/signals splits a shared reactive core between its `.` and `/dom`
 // entries; serving the built dist locally (not via a CDN) keeps that core a
 // SINGLE instance so reactivity holds across the seam (see wcstack-signals/).
@@ -115,16 +115,8 @@ function under(file, root) {
 
 /** Map a URL path to a file on disk under one of the allowed roots, or null. */
 function resolveStatic(urlPath) {
-  // /vendor/ami-voice/** → the built package, mounted at the package ROOT so the
-  // `/auto/remoteEnv` side-effect entry (src/auto/remoteEnv.js → ../../dist/index.js)
-  // resolves buildless. Only dist/ and src/auto/ are exposed.
-  if (urlPath.startsWith("/vendor/ami-voice/")) {
-    const rel = urlPath.slice("/vendor/ami-voice/".length);
-    const file = normalize(join(PACKAGE_DIR, rel));
-    const autoRoot = join(PACKAGE_DIR, "src", "auto");
-    return (under(file, DIST_DIR) || under(file, autoRoot)) ? file : null;
-  }
   // /vendor/signals/** → @wcstack/signals built dist (single shared core chunk).
+  // (<ami-voice> itself now loads from esm.run, not from this server.)
   if (urlPath.startsWith("/vendor/signals/")) {
     const rel = urlPath.slice("/vendor/signals/".length);
     const file = normalize(join(SIGNALS_DIR, rel));

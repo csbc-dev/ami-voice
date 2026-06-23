@@ -1,0 +1,23 @@
+{
+  "name": "ami-voice-example-voice-llm",
+  "private": true,
+  "type": "module",
+  "description": "Wire <ami-voice> (speech) into <ai-agent> (LLM) with binding only — voice → transcript → LLM summary. Both Cores run server-side; no secret reaches the browser.",
+  "scripts": {
+    "server": "node server.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@csbc-dev/ami-voice": "^0.1.0",
+    "@csbc-dev/ai-agent": "^0.2.0",
+    "@wc-bindable/core": "^0.8.0",
+    "@wc-bindable/remote": "^0.8.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vite": "^6.3.0"
+  }
+}

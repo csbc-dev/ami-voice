@@ -38,7 +38,8 @@
     "test:coverage": "vitest run __tests__ --coverage",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "npm run build && playwright test",
-    "example": "node examples/relayServer.mjs"
+    "example": "node examples/relayServer.mjs",
+    "examples:server": "node examples/shared/server.mjs"
   },
   "keywords": [
     "web-components",

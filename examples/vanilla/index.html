@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vanilla + &lt;ami-voice&gt;</title>
+</head>
+<body>
+  <main>
+    <h1>Vanilla TS + <code>&lt;ami-voice&gt;</code></h1>
+    <p class="lead">
+      Speech recognition for the AmiVoice cloud API. The APPKEY stays on the shared
+      server; this page binds the <code>&lt;ami-voice&gt;</code> element's reactive state with
+      <code>bind()</code> from <code>@wc-bindable/core</code> — no framework.
+    </p>
+    <div class="badges">
+      <span class="badge">Vanilla TS</span>
+      <span class="badge wc">&lt;ami-voice&gt;</span>
+      <span class="badge">@wc-bindable/core</span>
+    </div>
+
+    <!-- ── Realtime ──────────────────────────────────────────────────────── -->
+    <section>
+      <h2>Realtime (relay)</h2>
+      <!-- The <ami-voice> element is created in main.ts (from config) and appended here. -->
+      <div id="ami-host"></div>
+
+      <div class="row">
+        <button id="toggle">🎤 Start</button>
+        <button id="reset" class="ghost">Reset</button>
+        <span class="status"><span id="dot" class="dot"></span><span id="status-label">idle</span></span>
+      </div>
+
+      <div class="meter"><span id="level" style="width:0%"></span></div>
+
+      <div class="transcript"><span id="transcript"></span><span id="interim" class="interim"></span></div>
+      <ul id="segments" class="segments"></ul>
+      <div id="rt-error" class="error" hidden></div>
+      <p class="muted">Allow the microphone when prompted. Chrome recommended.</p>
+    </section>
+
+    <!-- ── File recognition ─────────────────────────────────────────────── -->
+    <section>
+      <h2>File recognition</h2>
+      <div class="row">
+        <input id="file" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac" />
+        <button id="recognize" disabled>Recognize</button>
+      </div>
+      <div id="file-out" hidden>
+        <div id="file-transcript" class="transcript"></div>
+        <ul id="file-segments" class="segments"></ul>
+        <p id="file-offline" class="muted" hidden>
+          Offline fake result — set <code>AMIVOICE_APPKEY</code> on the server for real recognition.
+        </p>
+      </div>
+      <div id="file-error" class="error" hidden></div>
+      <p class="muted">Posts the file to the shared server's <code>/api/recognize</code> (server-side recognition).</p>
+    </section>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

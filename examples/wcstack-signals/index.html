@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>@wcstack/signals + &lt;ami-voice&gt;</title>
+  <link rel="stylesheet" href="/shared/styles.css" />
+
+  <!-- Relay control URL for remoteEnv's global hook. A plain (non-module) script
+       so it runs BEFORE the deferred modules that read it. -->
+  <script>globalThis.AMIVOICE_REMOTE_CORE_URL = `ws://${location.host}/`;</script>
+
+  <!-- @wcstack/signals' core and /dom entries share ONE reactive core chunk, so
+       both are served from THIS server (not a CDN) — a CDN that inlines the core
+       into each entry would split reactivity across the seam. <ami-voice> is also
+       served here (unpublished pre-release); its bare deps map to a CDN. AFTER
+       `npm publish`, <ami-voice> can load from esm.run and the two @wc-bindable
+       entries go away (esm.run resolves them itself). -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@wc-bindable/core": "https://esm.run/@wc-bindable/core@0.8.0",
+      "@wc-bindable/remote": "https://esm.run/@wc-bindable/remote@0.8.0",
+      "@wcstack/signals": "/vendor/signals/index.esm.js",
+      "@wcstack/signals/dom": "/vendor/signals/dom.esm.js"
+    }
+  }
+  </script>
+
+  <!-- Register <ami-voice> in remote/relay mode with NO hand-written bootstrap: the
+       /auto/remoteEnv side-effect entry reads the control URL from the global hook
+       above. After publish: src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv". -->
+  <script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
+</head>
+<body>
+
+<h1>@wcstack/signals + <code>&lt;ami-voice&gt;</code></h1>
+<p class="lead">
+  A buildless, signals-based reactive core driving real DOM with <code>h()</code>, consuming the
+  <code>&lt;ami-voice&gt;</code> element through the wc-bindable adapter: <code>bindNode()</code> turns
+  its reactive properties into read-only signals; <code>command()</code> drives start / stop / reset.
+</p>
+<div class="badges">
+  <span class="badge">@wcstack/signals</span>
+  <span class="badge wc">&lt;ami-voice&gt;</span>
+  <span class="badge">buildless</span>
+</div>
+
+<!-- The headless element. engine/codec are inputs; signals read its outputs. -->
+<ami-voice id="ami" engine="-a-general" codec="LSB16K"></ami-voice>
+
+<section>
+  <h2>Realtime (relay)</h2>
+  <div id="realtime-app"></div>
+  <p class="muted">Allow the microphone when prompted. Chrome recommended.</p>
+</section>
+
+<section>
+  <h2>File recognition</h2>
+  <div id="file-app"></div>
+  <p class="muted">Posts the file to <code>/api/recognize</code> (server-side recognition).</p>
+</section>
+
+<script type="module">
+  import { signal, createRoot, bindNode } from "@wcstack/signals";
+  import { h, render, For } from "@wcstack/signals/dom";
+
+  function errMsg(e) {
+    if (!e) return "";
+    if (typeof e === "object" && "message" in e) return String(e.message ?? e);
+    return String(e);
+  }
+  const conf = (s) => `conf ${Number(s.confidence).toFixed(2)}`;
+  const segKey = (s) => s.utteranceid ?? `${s.starttime}-${s.endtime}`;
+
+  await customElements.whenDefined("ami-voice");
+  const el = document.getElementById("ami");
+  // Read the element's wc-bindable properties as read-only signals; drive its
+  // commands imperatively. bindNode has no idea a relay proxy sits behind it.
+  const bound = bindNode(el);
+  const sig = bound.signals;
+
+  // ── File-recognition local signals (plain fetch to the shared server) ──────
+  const fileResult = signal(null);
+  const fileLoading = signal(false);
+  const fileError = signal("");
+  const hasFile = signal(false);
+
+  const fileInput = h("input", {
+    type: "file",
+    accept: "audio/*,.wav,.mp3,.m4a,.flac",
+    onChange: () => hasFile.set(!!fileInput.files?.length),
+  });
+
+  async function recognizeFile() {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    fileLoading.set(true); fileError.set(""); fileResult.set(null);
+    try {
+      const res = await fetch("/api/recognize?engine=-a-general&codec=16K", { method: "POST", body: file });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      fileResult.set(data);
+    } catch (e) {
+      fileError.set(errMsg(e));
+    } finally {
+      fileLoading.set(false);
+    }
+  }
+
+  createRoot(() => {
+    // ── Realtime view ───────────────────────────────────────────────────────
+    render(
+      h("div", null,
+        h("div", { class: "row" },
+          h("button", {
+            class: () => (sig.recognizing.get() ? "rec" : ""),
+            onClick: () => (sig.recognizing.get() ? bound.command("stop") : bound.command("start")),
+          }, () => (sig.recognizing.get() ? "■ Stop" : "🎤 Start")),
+          h("button", { class: "ghost", onClick: () => bound.command("reset") }, "Reset"),
+          h("span", { class: "status" },
+            h("span", { class: () => "dot" + (sig.recognizing.get() ? " on" : "") }),
+            h("span", null, () =>
+              sig.recognizing.get() ? "recognizing" : sig.connected.get() ? "connected" : "idle"),
+          ),
+        ),
+        h("div", { class: "meter" },
+          h("span", { style: () => `width:${Math.min(100, Math.round(sig.level.get() * 140))}%` }),
+        ),
+        h("div", { class: "transcript" },
+          () => sig.transcript.get(),
+          h("span", { class: "interim" }, () => (sig.interim.get() ? " " + sig.interim.get() : "")),
+        ),
+        h("ul", { class: "segments" },
+          For(() => sig.segments.get() ?? [], (s) =>
+            h("li", null,
+              h("span", null, s.text),
+              h("span", { class: "seg-conf" }, conf(s)),
+            ), { key: segKey }),
+        ),
+        h("div", { class: "error", style: () => (sig.error.get() ? "" : "display:none") },
+          () => errMsg(sig.error.get())),
+      ),
+      document.getElementById("realtime-app"),
+    );
+
+    // ── File view ─────────────────────────────────────────────────────────────
+    render(
+      h("div", null,
+        h("div", { class: "row" },
+          fileInput,
+          h("button", {
+            disabled: () => fileLoading.get() || !hasFile.get(),
+            onClick: recognizeFile,
+          }, () => (fileLoading.get() ? "Recognizing…" : "Recognize")),
+        ),
+        h("div", { class: "transcript", style: () => (fileResult.get() ? "" : "display:none") },
+          () => fileResult.get()?.transcript ?? ""),
+        h("ul", { class: "segments" },
+          For(() => fileResult.get()?.segments ?? [], (s) =>
+            h("li", null,
+              h("span", null, s.text),
+              h("span", { class: "seg-conf" }, conf(s)),
+            ), { key: segKey }),
+        ),
+        h("p", { class: "muted", style: () => (fileResult.get()?.offline ? "" : "display:none") },
+          "Offline fake result — set AMIVOICE_APPKEY on the server for real recognition."),
+        h("div", { class: "error", style: () => (fileError.get() ? "" : "display:none") },
+          () => fileError.get()),
+      ),
+      document.getElementById("file-app"),
+    );
+  });
+</script>
+
+</body>
+</html>

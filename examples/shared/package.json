@@ -1,0 +1,13 @@
+{
+  "name": "ami-voice-example-shared-server",
+  "private": true,
+  "type": "module",
+  "description": "Shared server for the @csbc-dev/ami-voice examples (relay WS + file HTTP + static hosting).",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "comment": "Dependencies (ws, @wc-bindable/remote) and the built package (../../dist) are resolved from the repository root node_modules — no separate install is needed. Run `npm run build` in the repo root first, then `node examples/shared/server.mjs`.",
+  "dependencies": {
+    "@wcstack/signals": "^1.14.0"
+  }
+}

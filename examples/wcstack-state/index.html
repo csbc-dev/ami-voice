@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>@wcstack/state + &lt;ami-voice&gt;</title>
+  <link rel="stylesheet" href="/shared/styles.css" />
+
+  <!-- Relay control URL for remoteEnv's global hook. A plain (non-module) script
+       so it runs BEFORE the deferred module that reads it. -->
+  <script>globalThis.AMIVOICE_REMOTE_CORE_URL = `ws://${location.host}/`;</script>
+
+  <!-- <ami-voice> is served by THIS server (the package is unpublished pre-release,
+       so esm.run can't serve it yet). Its only bare imports — @wc-bindable/core /
+       @wc-bindable/remote — map to a CDN. AFTER `npm publish`, this whole block can
+       become a single esm.run entry and /vendor goes away:
+         "@csbc-dev/ami-voice": "https://esm.run/@csbc-dev/ami-voice"
+       (esm.run resolves the @wc-bindable deps itself). -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@wc-bindable/core": "https://esm.run/@wc-bindable/core@0.8.0",
+      "@wc-bindable/remote": "https://esm.run/@wc-bindable/remote@0.8.0"
+    }
+  }
+  </script>
+
+  <!-- Register <ami-voice> in remote/relay mode with NO hand-written bootstrap: the
+       /auto/remoteEnv side-effect entry reads the control URL from the global hook
+       above (remoteSettingType:"env"). Loaded BEFORE @wcstack/state/auto so the
+       element is defined before <wcs-state> scans its data-wcs bindings. After publish:
+         src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv" -->
+  <script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
+
+  <!-- @wcstack/state: declarative HTML data binding (buildless, from a CDN). -->
+  <script type="module" src="https://esm.run/@wcstack/state/auto"></script>
+</head>
+<body>
+
+<h1>@wcstack/state + <code>&lt;ami-voice&gt;</code></h1>
+<p class="lead">
+  No build, no framework. <code>&lt;wcs-state&gt;</code> binds the <code>&lt;ami-voice&gt;</code>
+  element's reactive state to the DOM with <code>data-wcs</code> path strings, and drives
+  its <code>start</code> / <code>stop</code> / <code>reset</code> commands via command tokens.
+</p>
+<div class="badges">
+  <span class="badge">@wcstack/state</span>
+  <span class="badge wc">&lt;ami-voice&gt;</span>
+  <span class="badge">buildless</span>
+</div>
+
+<wcs-state>
+  <script type="module">
+    export default {
+      // command tokens fire <ami-voice> methods (start/stop/reset) from state.
+      $commandTokens: ["startRec", "stopRec", "resetRec"],
+
+      // One slot mirrors the element's wcBindable outputs. The ...: spread on the
+      // element wires every property; only the keys declared here are templated.
+      rec: {
+        transcript: "", interim: "", recognizing: false, connected: false,
+        level: 0, segments: [], confidence: 0,
+      },
+
+      // File-recognition UI state.
+      fileTranscript: "", fileSegments: [], fileError: "", fileOffline: false,
+      fileLoading: false, fileShow: false,
+
+      get micLabel() { return this["rec.recognizing"] ? "■ Stop" : "🎤 Start"; },
+      get statusLabel() {
+        return this["rec.recognizing"] ? "recognizing"
+          : this["rec.connected"] ? "connected" : "idle";
+      },
+      get levelWidth() { return Math.min(100, Math.round(this["rec.level"] * 140)) + "%"; },
+      get recognizeLabel() { return this.fileLoading ? "Recognizing…" : "Recognize"; },
+
+      toggle() {
+        if (this["rec.recognizing"]) this.$command.stopRec.emit();
+        else this.$command.startRec.emit();
+      },
+      resetIt() { this.$command.resetRec.emit(); },
+
+      async recognizeFile() {
+        const input = document.getElementById("state-file");
+        const file = input?.files?.[0];
+        if (!file) return;
+        this.fileLoading = true; this.fileError = ""; this.fileShow = false;
+        try {
+          // Same origin as this page (served by the shared server) → relative URL.
+          const res = await fetch("/api/recognize?engine=-a-general&codec=16K", { method: "POST", body: file });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || res.statusText);
+          this.fileTranscript = data.transcript;
+          this.fileSegments = data.segments;
+          this.fileOffline = !!data.offline;
+          this.fileShow = true;
+        } catch (e) {
+          this.fileError = String(e?.message ?? e);
+        } finally {
+          this.fileLoading = false;
+        }
+      },
+    };
+  </script>
+</wcs-state>
+
+<!-- The headless element. engine/codec are inputs (attributes); the ...: spread
+     reads its outputs into `rec`; command tokens drive its methods. -->
+<ami-voice id="ami" engine="-a-general" codec="LSB16K"
+  data-wcs="...: rec; command.start: $command.startRec; command.stop: $command.stopRec; command.reset: $command.resetRec"></ami-voice>
+
+<!-- ── Realtime ──────────────────────────────────────────────────────────── -->
+<section>
+  <h2>Realtime (relay)</h2>
+  <div class="row">
+    <button data-wcs="onclick: toggle; textContent: micLabel; class.rec: rec.recognizing"></button>
+    <button class="ghost" data-wcs="onclick: resetIt">Reset</button>
+    <span class="status">
+      <span class="dot" data-wcs="class.on: rec.recognizing"></span>
+      <span data-wcs="textContent: statusLabel"></span>
+    </span>
+  </div>
+
+  <div class="meter"><span data-wcs="style.width: levelWidth"></span></div>
+
+  <div class="transcript">
+    <span data-wcs="textContent: rec.transcript"></span>
+    <span class="interim" data-wcs="textContent: rec.interim"></span>
+  </div>
+
+  <ul class="segments">
+    <template data-wcs="for: rec.segments">
+      <li>
+        <span data-wcs="textContent: .text"></span>
+        <span class="seg-conf" data-wcs="textContent: .confidence|fix(2)"></span>
+      </li>
+    </template>
+  </ul>
+  <p class="muted">Allow the microphone when prompted. Chrome recommended.</p>
+</section>
+
+<!-- ── File recognition ──────────────────────────────────────────────────── -->
+<section>
+  <h2>File recognition</h2>
+  <div class="row">
+    <input id="state-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac" />
+    <button data-wcs="onclick: recognizeFile; disabled: fileLoading; textContent: recognizeLabel"></button>
+  </div>
+
+  <template data-wcs="if: fileShow">
+    <div class="transcript" data-wcs="textContent: fileTranscript"></div>
+    <ul class="segments">
+      <template data-wcs="for: fileSegments">
+        <li>
+          <span data-wcs="textContent: .text"></span>
+          <span class="seg-conf" data-wcs="textContent: .confidence|fix(2)"></span>
+        </li>
+      </template>
+    </ul>
+    <template data-wcs="if: fileOffline">
+      <p class="muted">Offline fake result — set <code>AMIVOICE_APPKEY</code> on the server for real recognition.</p>
+    </template>
+  </template>
+  <template data-wcs="if: fileError">
+    <div class="error" data-wcs="textContent: fileError"></div>
+  </template>
+  <p class="muted">Posts the file to <code>/api/recognize</code> (server-side recognition).</p>
+</section>
+
+</body>
+</html>

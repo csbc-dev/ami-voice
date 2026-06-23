@@ -1,0 +1,20 @@
+{
+  "name": "ami-voice-example-vanilla",
+  "private": true,
+  "type": "module",
+  "description": "Vanilla TS example for @csbc-dev/ami-voice — file recognition + realtime relay, bound with @wc-bindable/core.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@csbc-dev/ami-voice": "file:../..",
+    "@wc-bindable/core": "^0.8.0",
+    "@wc-bindable/remote": "^0.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vite": "^6.3.0"
+  }
+}

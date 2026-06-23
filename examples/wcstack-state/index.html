@@ -51,6 +51,13 @@
 
 <wcs-state>
   <script type="module">
+    // The picked File rides a plain module var, not a reactive slot: a binary
+    // payload doesn't belong in reactive state (the @wcstack/signals sibling makes
+    // the same call, reading its live <input> node). recognizeFile() POSTs it
+    // straight to the server. The CAPTURE is still declarative — see pickFile +
+    // the input's data-wcs="onchange: pickFile" below.
+    let pickedFile = null;
+
     export default {
       // command tokens fire <ami-voice> methods (start/stop/reset) from state.
       $commandTokens: ["startRec", "stopRec", "resetRec"],
@@ -81,9 +88,13 @@
       },
       resetIt() { this.$command.resetRec.emit(); },
 
+      // Declarative capture: the file <input> fires this on change (data-wcs=
+      // "onchange: pickFile"). @wcstack/state calls handlers as (event, ...loopIndexes)
+      // with `this` = state, so e.target is the input — no getElementById reach-in.
+      pickFile(e) { pickedFile = e.target.files?.[0] ?? null; },
+
       async recognizeFile() {
-        const input = document.getElementById("state-file");
-        const file = input?.files?.[0];
+        const file = pickedFile;
         if (!file) return;
         this.fileLoading = true; this.fileError = ""; this.fileShow = false;
         try {
@@ -145,7 +156,7 @@
 <section>
   <h2>File recognition</h2>
   <div class="row">
-    <input id="state-file" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac" />
+    <input type="file" accept="audio/*,.wav,.mp3,.m4a,.flac" data-wcs="onchange: pickFile" />
     <button data-wcs="onclick: recognizeFile; disabled: fileLoading; textContent: recognizeLabel"></button>
   </div>
 

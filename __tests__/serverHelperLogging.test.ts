@@ -80,4 +80,25 @@ describe("createAmiVoiceRelayServer — injectable structured logging (3.5)", ()
     await ctrl.core.start();
     expect(() => ctrl.dispose()).not.toThrow();
   });
+
+  it("redacts an authorization=<APPKEY> substring before logging a Core error (SPEC §14)", async () => {
+    const events: AmiVoiceServerLogEvent[] = [];
+    // Simulate an upstream non-ok `s` ack echoing the raw command back, which
+    // ends in `authorization=<permanent APPKEY>` — the exact leak redactSecrets exists for.
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: async () => {
+        throw new Error("s LSB16K -a-general authorization=PERMANENT-APPKEY rejected");
+      },
+      recognizeFile: async () => [],
+    };
+    const server = createAmiVoiceRelayServer({ createProvider: () => provider, logger: (e) => events.push(e) });
+
+    const ctrl = server.handleControlConnection(fakeTransport());
+    await ctrl.core.start();
+
+    const err = events.find((e) => e.type === "error") as { message: string };
+    expect(err).toBeDefined();
+    expect(err.message).toContain("authorization=<redacted>");
+    expect(err.message).not.toContain("PERMANENT-APPKEY");
+  });
 });

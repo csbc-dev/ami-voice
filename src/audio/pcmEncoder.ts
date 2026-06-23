@@ -15,6 +15,13 @@ import { raiseError } from "../raiseError.js";
  */
 export const SHELL_SUPPORTED_CODECS: readonly string[] = ["LSB16K"];
 
+/**
+ * Default streaming codec (16 kHz signed little-endian PCM). Single source of
+ * truth for both the Core input default and the Shell's `start()` codec guard,
+ * so they cannot drift.
+ */
+export const DEFAULT_CODEC = "LSB16K";
+
 /** Whether the Shell's encoder can produce `codec` (case-insensitive — AmiVoice ids are). */
 export function canEncodeCodec(codec: string): boolean {
   return SHELL_SUPPORTED_CODECS.includes(codec.toUpperCase());

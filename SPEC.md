@@ -1,6 +1,6 @@
 # AmiVoice Component SPEC
 
-This document defines the design contract for the `@csbc-dev/ami-voice` package. A compiling scaffold exists (`src/`, tests, build); the AmiVoice transport itself (realtime WSS loop, async HTTP) is still stubbed in `AmiVoiceProvider`. This SPEC is the normative "what"; the **why** lives in [docs/adr/](docs/adr/); the open **how** decisions live in [docs/implementation-notes.md](docs/implementation-notes.md).
+This document defines the design contract for the `@csbc-dev/ami-voice` package. The AmiVoice transport is implemented and tested — the realtime WSS loop (relay + browser-direct) and the async-v2 HTTP file path both run in `AmiVoiceProvider` (see the status table in §23); what remains is the real-AmiVoice smoke run and the user-driven release. This SPEC is the normative "what"; the **why** lives in [docs/adr/](docs/adr/); the open **how** decisions live in [docs/implementation-notes.md](docs/implementation-notes.md).
 
 The package target is a declarative speech-recognition component built with CSBC and `wc-bindable-protocol`, wrapping Advanced Media's **AmiVoice** cloud recognition API. It is **remote-first**: recognition authority and the APPKEY stay in a privileged server runtime, while the browser custom element exposes bindable state and runs the microphone data plane.
 
@@ -224,7 +224,7 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 ## 17. Error contract
 
 - Recognition / provider failures (start, session I/O, file recognition) **publish to `error` and clear `loading`** — they MUST NOT reject the command Promise. Consumers bind `error`.
-- AmiVoice rejections carry a single-character result `code` (`-` auth, `+` unsupported format, `%` audio too large, `o` below-threshold, `b` server busy, `x` grammar not loaded, `c` cancelled, `?`/`!`/`>`/`<`/`#`/`$` upstream failures, `^` invalid parameter). The Core SHOULD normalize these into a closed `AmiVoiceErrorCode` union while preserving the raw `message`; the client-error subset (`>`, `o`, `+`, `-`, `%`) is non-retryable.
+- AmiVoice rejections carry a single-character result `code` (`-` auth, `+` unsupported format, `%` audio too large, `$` client-audio timeout, `o` below-threshold, `b` server busy, `x` grammar not loaded, `c` cancelled, `?` fatal server error, `!`/`>`/`<`/`#` recognizer connect/send/receive/parse (upstream) failures, `^` invalid parameter). The Core SHOULD normalize these into a closed `AmiVoiceErrorCode` union while preserving the raw `message`; the client-error subset (`>`, `o`, `+`, `-`, `%`) is non-retryable.
 - Over the network, only a serializable `{ name, message, stack? }` shape crosses (per `@wc-bindable/remote`); a producer SHOULD redact `stack` on untrusted boundaries.
 - Precondition violations that are programmer errors (e.g. a missing APPKEY server-side) MAY throw synchronously in the provider.
 
@@ -237,7 +237,7 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 
 ## 19. File mode (Case B1) contract
 
-- `recognizeFile(blob)` is a Core command. The Core selects sync vs async by policy (size), POSTs with the APPKEY, polls async jobs, normalizes `segments`, and appends them to `transcript` / `segments`.
+- `recognizeFile(blob)` is a Core command. v1 always uses the **async v2** path: POST to enqueue with the APPKEY, poll the job (exponential backoff, bounded by a deadline), normalize `segments`, and append them to `transcript` / `segments`. A sync `recognize` path and size-threshold selection remain an open item ([Q8](docs/implementation-notes.md)), not current behavior.
 - No browser data plane is involved beyond handing the Core a `File` / `Blob`.
 
 ## 20. Performance expectations

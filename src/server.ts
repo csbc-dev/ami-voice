@@ -40,7 +40,11 @@ export { toSpeakerSegment, speakerLabelOf } from "./speakerView.js";
 export type {
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers,
   RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult, SpeakerSegment,
-  AmiVoiceCodec, AmiVoiceEngine,
+  AmiVoiceCodec, AmiVoiceEngine, AmiVoiceTransport,
+  // Direct-mode (docs/adr/0006) provider API types: `AmiVoiceProvider`
+  // (a /server export) exposes `prepareDirectSession`/`issueOneTimeAppKey`,
+  // whose argument/result types a Node consumer must be able to name.
+  DirectSessionInfo, DirectMintOptions,
   SerializedError, WcsAmiVoiceAnyError,
   AmiVoiceCoreValues,
 } from "./types.js";

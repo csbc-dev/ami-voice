@@ -22,6 +22,27 @@ import type { IRealtimeSession, RealtimeSessionHandlers } from "../types.js";
 const AUDIO_FRAME_BYTE = AUDIO_FRAME_PREFIX.charCodeAt(0);
 
 /**
+ * Wrap a platform `WebSocket` as a `RealtimeSocket`. Shared by the server-side
+ * provider (relay) and the browser-direct path so the adapter lives in one place
+ * (a `ws`-lib / Blob-frame fix is then made once). Only string `onmessage` frames
+ * are forwarded — events arrive as text; audio is sent (never received) binary.
+ */
+export function wrapWebSocket(url: string): RealtimeSocket {
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  const sock: RealtimeSocket = {
+    send: (d) => ws.send(d),
+    close: () => ws.close(),
+    onopen: null, onmessage: null, onclose: null, onerror: null,
+  };
+  ws.onopen = () => sock.onopen?.();
+  ws.onmessage = (e: MessageEvent) => { if (typeof e.data === "string") sock.onmessage?.(e.data); };
+  ws.onclose = () => sock.onclose?.();
+  ws.onerror = (e) => sock.onerror?.(e);
+  return sock;
+}
+
+/**
  * Minimal socket surface the realtime loop drives. The platform factories wrap
  * `WebSocket`; tests inject a fake. Events (`S`/`E`/`C`/`U`/`A`/`G`, acks) arrive
  * as text frames via `onmessage`; `p` audio is sent as binary.
@@ -35,32 +56,72 @@ export interface RealtimeSocket {
   onerror: ((err: unknown) => void) | null;
 }
 
+/** Default connect/`s`-ack deadline (ms). A stalled upstream must not hang start(). */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
+
 /**
  * Run one realtime session over `socket`, sending `startCommand` on open and
  * resolving with an `IRealtimeSession` once AmiVoice acks `s`. Failures before
  * the ack reject; failures after it go to `handlers.onError`.
  *
- * @param socket        already-constructed transport (server WSS or browser WSS).
- * @param startCommand  the fully built `s` command (APPKEY / one-time token baked in).
- * @param handlers      result/lifecycle callbacks (Core or in-page Core).
- * @param stopTimeoutMs graceful-stop fallback timeout (docs/adr/0003, Q4/D1).
+ * @param socket           already-constructed transport (server WSS or browser WSS).
+ * @param startCommand     the fully built `s` command (APPKEY / one-time token baked in).
+ * @param handlers         result/lifecycle callbacks (Core or in-page Core).
+ * @param stopTimeoutMs    graceful-stop fallback timeout (docs/adr/0003, Q4/D1).
+ * @param connectTimeoutMs deadline from open → `s` ack; guards a stalled/half-open
+ *                         upstream that never acks and never closes (default 10 s).
  */
 export function runRealtimeSession(
   socket: RealtimeSocket,
   startCommand: string,
   handlers: RealtimeSessionHandlers,
   stopTimeoutMs: number,
+  connectTimeoutMs: number = DEFAULT_CONNECT_TIMEOUT_MS,
 ): Promise<IRealtimeSession> {
   let started = false;
+  // True once the `ready` promise has settled (resolve OR reject). Guards the
+  // pre-start branches against a LATE event arriving in the async close window:
+  // after a connect-timeout/onerror reject calls socket.close(), a real platform
+  // WebSocket fires onclose asynchronously, so a late ok `s`-ack could still
+  // arrive and (without this) flip `started`, making the deferred onclose
+  // misreport a spurious "connection lost mid-session" drop.
+  let settled = false;
   // Set by stop()/abort() so a teardown WE initiated is not misreported as an
   // upstream drop (Phase 3.1 / implementation-notes Q3).
   let intentionalClose = false;
   let onEAck: (() => void) | null = null;
+  // Set while a graceful stop() is in flight so an `onclose` that arrives before
+  // the `e` ack (the common server-initiated-close-after-`e` shutdown) settles
+  // the stop() immediately, rather than waiting out the full stopTimeoutMs
+  // fallback (which would delay Core teardown and the relay token reap).
+  let onSocketClosed: (() => void) | null = null;
+  // Single in-flight graceful stop. A second concurrent stop() (e.g. a double-
+  // clicked stop button over `@wc-bindable/remote` — `AmiVoiceCore.stop()` reads
+  // `_session` and awaits before nulling it) returns this same promise instead of
+  // re-arming onEAck/onSocketClosed/the fallback timer. Re-arming would orphan the
+  // first stop's settle hooks so its promise only resolves on its own fallback
+  // timer (the up-to-stopTimeoutMs delay the onSocketClosed hook exists to avoid).
+  let stopping: Promise<void> | null = null;
 
   const ready = new Promise<void>((resolve, reject) => {
+    // `RealtimeSocket` is an injectable seam (tests/custom transports); a close()
+    // that throws after we have already rejected must not escape as an unhandled
+    // exception. Guard every reject-path close, mirroring stop()'s send() guard.
+    const closeQuietly = (): void => { try { socket.close(); } catch { /* already settling */ } };
+    // Bound the handshake: if the `s` ack never arrives (and the socket neither
+    // closes nor errors — a half-open/black-holed upstream), reject so start()
+    // does not hang with `loading` stuck true forever.
+    const connectTimer = setTimeout(() => {
+      if (started || settled) return;
+      settled = true;
+      reject(new AmiVoiceError("!", `AmiVoice did not ack the start command within ${connectTimeoutMs}ms`));
+      closeQuietly();
+    }, connectTimeoutMs);
+    const clearConnectTimer = (): void => { clearTimeout(connectTimer); };
     socket.onopen = () => socket.send(startCommand);
     socket.onclose = () => {
-      if (!started) { reject(new AmiVoiceError("!", "AmiVoice connection closed before start")); return; }
+      clearConnectTimer();
+      if (!started) { if (!settled) { settled = true; reject(new AmiVoiceError("!", "AmiVoice connection closed before start")); } return; }
       // After the session is up, a close we did NOT initiate is an upstream drop
       // mid-stream. AmiVoice has no resume (implementation-notes Q3), so v1 policy
       // is: surface it as an `error` + `connected=false` and require an explicit
@@ -70,19 +131,40 @@ export function runRealtimeSession(
         handlers.onError(new AmiVoiceError("<", "AmiVoice connection lost mid-session"));
       }
       handlers.onClose();
+      // Settle any in-flight graceful stop() the moment the socket actually
+      // closes (idempotent via stop()'s `done` guard), so we don't wait out the
+      // fallback timer when the server closes before acking `e`.
+      onSocketClosed?.();
     };
     socket.onerror = (err) => {
       const e = err instanceof Error ? err : new AmiVoiceError("!", "AmiVoice socket error");
-      if (!started) reject(e);
+      if (!started) { if (!settled) { settled = true; clearConnectTimer(); reject(e); } }
       else handlers.onError(e);
     };
     socket.onmessage = (raw) => {
       const ev = parseEvent(raw);
       if (!started) {
+        // A late event arriving after the handshake already settled (the close
+        // window after a connect-timeout/onerror reject) must NOT flip `started`,
+        // or the deferred onclose would misreport an upstream drop.
+        if (settled) return;
         // Only the `s` ack matters before the session is up.
         if (ev.type === "ack" && ev.command === "s") {
-          if (ev.ok) { started = true; resolve(); }
-          else reject(new AmiVoiceError("-", ev.message ?? "AmiVoice rejected the start command"));
+          clearConnectTimer();
+          // AmiVoice rejects `s` for many reasons (server busy, no grammar,
+          // bad format, …), not just auth; its ack message is free text with no
+          // reliable code prefix. Use a neutral/unknown code (retryable) rather
+          // than asserting `"-"`/auth (which would falsely mark a transient
+          // failure non-retryable). The raw message is preserved.
+          if (ev.ok) { settled = true; started = true; resolve(); }
+          else {
+            // A protocol-level `s` rejection is not followed by a socket close
+            // (unlike onerror), so close it here — mirroring the connect-timeout
+            // branch — rather than orphan a live upstream WSS per rejected start.
+            settled = true;
+            reject(new AmiVoiceError("", ev.message ?? "AmiVoice rejected the start command"));
+            closeQuietly();
+          }
         }
         return;
       }
@@ -93,8 +175,16 @@ export function runRealtimeSession(
         case "U": handlers.onInterim(ev.result); break;
         case "A": handlers.onFinal(ev.result); break;
         case "ack":
-          if (ev.command === "e") onEAck?.();
-          else if (!ev.ok) handlers.onError(new AmiVoiceError("?", ev.message));
+          if (ev.command === "e") {
+            // A non-ok `e` ack means AmiVoice failed to finalize the stream at
+            // flush time — surface the error, but still settle the graceful stop
+            // (the flush is over). SPEC §18's "never error" rule is scoped to the
+            // lost-ack TIMEOUT fallback, not an explicit error ack.
+            if (!ev.ok) handlers.onError(new AmiVoiceError("?", ev.message));
+            onEAck?.();
+          } else if (!ev.ok) {
+            handlers.onError(new AmiVoiceError("?", ev.message));
+          }
           break;
         case "G": // opaque server info (implementation-notes D4) — ignored for v1
         case "unknown":
@@ -111,32 +201,42 @@ export function runRealtimeSession(
       frame.set(bytes, 1);
       socket.send(frame);
     },
-    stop: (): Promise<void> => new Promise<void>((resolve) => {
-      let done = false;
-      // A graceful stop is consumer-initiated teardown: mark it before the `e`
-      // flush so a close during/after the flush is not reported as an upstream
-      // drop (3.1). On a lost `e` ack the fallback timer still settles us.
-      intentionalClose = true;
-      const finish = (): void => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        socket.close();
-        resolve();
-      };
-      onEAck = finish; // settle when AmiVoice acks `e` (end-of-results, D1)
-      const timer = setTimeout(finish, stopTimeoutMs);
-      // The platform WebSocket only throws from send() while CONNECTING, which is
-      // unreachable here (this stop() exists only after the `s` ack). But
-      // `RealtimeSocket` is an injectable seam, so guard defensively: if a `send`
-      // throws, treat the stop goal as already met and settle — rather than
-      // rejecting and orphaning the fallback timer.
-      try {
-        socket.send("e");
-      } catch {
-        finish();
-      }
-    }),
+    stop: (): Promise<void> => {
+      // Idempotent: a second in-flight stop() joins the first rather than
+      // re-arming the single-slot hooks/timer (which would orphan the first).
+      if (stopping) return stopping;
+      stopping = new Promise<void>((resolve) => {
+        let done = false;
+        // A graceful stop is consumer-initiated teardown: mark it before the `e`
+        // flush so a close during/after the flush is not reported as an upstream
+        // drop (3.1). On a lost `e` ack the fallback timer still settles us.
+        intentionalClose = true;
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          onSocketClosed = null;
+          socket.close();
+          resolve();
+        };
+        onEAck = finish; // settle when AmiVoice acks `e` (end-of-results, D1)
+        // Also settle if the socket simply closes (server shutdown after `e`) —
+        // onclose calls this, avoiding the up-to-stopTimeoutMs fallback delay.
+        onSocketClosed = finish;
+        const timer = setTimeout(finish, stopTimeoutMs);
+        // The platform WebSocket only throws from send() while CONNECTING, which is
+        // unreachable here (this stop() exists only after the `s` ack). But
+        // `RealtimeSocket` is an injectable seam, so guard defensively: if a `send`
+        // throws, treat the stop goal as already met and settle — rather than
+        // rejecting and orphaning the fallback timer.
+        try {
+          socket.send("e");
+        } catch {
+          finish();
+        }
+      });
+      return stopping;
+    },
     abort: (): void => { intentionalClose = true; socket.close(); },
   }));
 }

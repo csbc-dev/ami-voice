@@ -1,6 +1,6 @@
 # `@csbc-dev/ami-voice` — Documentation
 
-A compiling scaffold exists (`src/`, tests, build); the AmiVoice transport is still stubbed. The documentation is layered: **ADRs** record *why* (settled decisions), **SPEC.md** records *what* (the normative contract), and **implementation-notes.md** records the open *how* (decisions an implementer must still make).
+The relay and browser-direct transports are implemented and tested (only the real-AmiVoice smoke run and the user-driven release remain — see [../SPEC.md](../SPEC.md) §23 and [implementation-plan.md](implementation-plan.md)). The documentation is layered: **ADRs** record *why* (settled decisions), **SPEC.md** records *what* (the normative contract), and **implementation-notes.md** records the open *how* (decisions an implementer must still make).
 
 For the package overview and CSBC context, see [../CLAUDE.md](../CLAUDE.md).
 
@@ -25,6 +25,8 @@ Each ADR records one design decision, its context, the alternatives weighed, and
 | [0005](adr/0005-audio-capture-and-codec-ownership.md) | Audio capture & codec ownership — Shell-owned framing, Core-owned codec policy | Accepted (design intent) |
 | [0006](adr/0006-transport-baseline-after-one-time-appkey.md) | Dual-mode transport — relay default + browser-direct opt-in (one-time APPKEY confirmed); server-helper shape | Accepted (design intent) — amends 0003 |
 | [0007](adr/0007-diarization-speaker-view.md) | Surface speaker diarization as a derived, final-only `speakers` property (resolves Q6) | Accepted (design intent) — extends 0004 |
+
+> **Note.** The decisions in ADRs 0001–0007 are now reflected in shipped, tested code (see [../SPEC.md](../SPEC.md) §23). The per-ADR "Accepted (design intent)" labels predate the implementation and are retained for history; read them as **Accepted** (the "reflected in shipped code" tier in the vocabulary below).
 
 ## How to add a new ADR
 

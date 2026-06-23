@@ -2,6 +2,7 @@ import { AmiVoiceCore } from "./core/AmiVoiceCore.js";
 import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
 import type { IAmiVoiceProvider, AmiVoiceTransport, WcsAmiVoiceAnyError } from "./types.js";
 import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
+import { redactSecrets } from "./redact.js";
 import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
 
 /**
@@ -98,18 +99,6 @@ export interface AmiVoiceRelayServer {
   sessionCount(): number;
 }
 
-/**
- * Strip any `authorization=<token>` substring from a message before it is logged.
- * Package-generated messages (errorCodes.ts) never carry one, but a non-ok
- * `s`/`p`/`e` ack echoes the raw upstream string (wnnProtocol.ts), and the `s`
- * command itself ends in `authorization=<APPKEY>`. Redacting here keeps the
- * "never log the APPKEY" guarantee (SPEC §11.3) true regardless of what upstream
- * reflects back.
- */
-function redactSecrets(message: string): string {
-  return message.replace(/authorization=\S+/gi, "authorization=<redacted>");
-}
-
 function toUint8(data: unknown): Uint8Array | null {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -160,6 +149,14 @@ export function createAmiVoiceRelayServer(
         if (detail) log({ type: "error", code: getErrorCode(detail), message: redactSecrets(detail.message) });
       };
       core.addEventListener("ami-voice:error", onCoreError);
+      // Reap the relay session token when the session ends (graceful stop OR an
+      // upstream drop the Core surfaces as `recognizing=false`), so `sessions`
+      // does not keep a stale `token → core` entry routable to a no-op Core until
+      // the control connection closes. A re-`start()` re-mints a fresh token.
+      const onRecognizingChanged = (e: Event): void => {
+        if ((e as CustomEvent).detail === false && token) { sessions.delete(token); token = null; }
+      };
+      if (transportMode !== "direct") core.addEventListener("ami-voice:recognizing-changed", onRecognizingChanged);
       log({ type: "control-open", transport: transportMode, peerAddress: connOptions.peerAddress });
       return {
         core,
@@ -167,6 +164,7 @@ export function createAmiVoiceRelayServer(
         dispose: () => {
           if (token) sessions.delete(token);
           core.removeEventListener("ami-voice:error", onCoreError);
+          core.removeEventListener("ami-voice:recognizing-changed", onRecognizingChanged);
           shell.dispose();
           core.abort();
           log({ type: "control-close", transport: transportMode, peerAddress: connOptions.peerAddress });

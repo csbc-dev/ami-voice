@@ -16,7 +16,7 @@ import { MicCapture } from "./micCapture.js";
 import { validateRemoteCoreUrl, openAudioChannel } from "./remoteConnection.js";
 import { DirectBrowserProvider } from "./realtimeSocket.js";
 import { shouldSendFrame, createRateLimiter, DEFAULT_MAX_AUDIO_BUFFER } from "../audio/flowControl.js";
-import { canEncodeCodec, SHELL_SUPPORTED_CODECS } from "../audio/pcmEncoder.js";
+import { canEncodeCodec, SHELL_SUPPORTED_CODECS, DEFAULT_CODEC } from "../audio/pcmEncoder.js";
 import { AmiVoiceError } from "../errorCodes.js";
 
 /**
@@ -74,6 +74,26 @@ export class AmiVoice extends HTMLElement {
   private readonly _levelGate = createRateLimiter(100);
   /** Drop audio frames when the audio WS buffer exceeds this cap (Q10). */
   private _maxAudioBuffer = DEFAULT_MAX_AUDIO_BUFFER;
+  /**
+   * True once the Shell has started its browser-only data plane (mic + audio
+   * channel) for an active session. Lets the `recognizing→false` listener tell a
+   * still-running mic (an unsolicited upstream drop) from an already-idle one.
+   */
+  private _dataPlaneLive = false;
+  /** Bound `recognizing-changed` listener that tears the mic down on session end. */
+  private readonly _onRecognizingChanged = (e: Event): void => {
+    if ((e as CustomEvent).detail === false && this._dataPlaneLive) this._stopDataPlane();
+  };
+  /**
+   * Mirror every `ami-voice:error` (Shell-set via `_setError`, the relay bind
+   * callback, OR the in-page Core via target injection in local/direct) into
+   * `_values.error`, so the single `error` getter has one authoritative source
+   * that always agrees with the last dispatched event — no split between
+   * `_core.error` and `_values.error`.
+   */
+  private readonly _onError = (e: Event): void => {
+    this._values.error = ((e as CustomEvent).detail as WcsAmiVoiceAnyError) ?? null;
+  };
 
   /**
    * Resolved internal transport (NOT the public `mode`): `"local"` (in-page Core,
@@ -93,6 +113,13 @@ export class AmiVoice extends HTMLElement {
   connectedCallback(): void {
     this._resolveMode();
     this._ensureConnected();
+    // When recognition stops for ANY reason — a deliberate stop()/abort() or an
+    // upstream drop the Core surfaces as `recognizing=false` (SPEC §10.1) — the
+    // Shell's mic + audio channel MUST stop too (CLAUDE.md "Clean teardown").
+    // This single listener covers all modes: relay fires it via the bind()
+    // callback, local/direct via the in-page Core's target injection (`this`).
+    this.addEventListener("ami-voice:recognizing-changed", this._onRecognizingChanged);
+    this.addEventListener("ami-voice:error", this._onError);
     this._emit("mode", this._mode);
   }
 
@@ -130,7 +157,10 @@ export class AmiVoice extends HTMLElement {
   get confidence(): number { return this._core ? this._core.confidence : Number(this._values.confidence ?? 0); }
   get loading(): boolean { return this._core ? this._core.loading : Boolean(this._values.loading); }
   get error(): WcsAmiVoiceAnyError {
-    const v = this._core ? this._core.error : this._values.error;
+    // `_values.error` is mirrored from every `ami-voice:error` (Shell-set AND
+    // in-page Core via `_onError`), so it always agrees with the last dispatched
+    // event. Fall back to the Core only for any error that predates the listener.
+    const v = this._values.error ?? (this._core ? this._core.error : null);
     return (v as WcsAmiVoiceAnyError) ?? null;
   }
   get level(): number { return this._level; }
@@ -161,6 +191,11 @@ export class AmiVoice extends HTMLElement {
   // control proxy inside its provider, then opens the AmiVoice WSS itself);
   // relay drives the server-side Core over the proxy + binary audio channel.
   async start(): Promise<void> {
+    // Re-entrancy guard: a rapid/accidental second start() (double-click, a
+    // framework re-render) must not open a second mic + audio channel and orphan
+    // the first. The server-side Core also guards its own start, but that does
+    // not protect the Shell's data plane.
+    if (this._dataPlaneLive) return;
     try {
       // The Shell physically encodes the audio, so it MUST refuse a codec it
       // cannot produce rather than silently stream LSB16K under another label
@@ -173,12 +208,21 @@ export class AmiVoice extends HTMLElement {
         )));
         return;
       }
+      // Claim the data plane synchronously (before any await) so a concurrent
+      // second start() hits the re-entrancy guard above. The catch's
+      // `_rollbackStart()` clears it on failure.
+      this._dataPlaneLive = true;
       this._ensureConnected();
       if (this._core) {
         await this._core.start();
+        // A session that opened and immediately dropped during the await above
+        // fires `recognizing→false`, whose listener tears the data plane down
+        // and clears the flag. Bail rather than re-arm a mic for a dead session.
+        if (!this._dataPlaneLive) return;
         await this._startMic((bytes) => this._core?.feedAudio(bytes));
       } else {
         const session = await this._proxy!.invoke("start");
+        if (!this._dataPlaneLive) return;
         await this._startMicRemote(session);
       }
     } catch (err) {
@@ -193,21 +237,31 @@ export class AmiVoice extends HTMLElement {
 
   /** Best-effort teardown of a partially-started session (see `start()`'s catch). */
   private _rollbackStart(): void {
-    this._mic?.stop();
-    this._closeAudio();
+    this._stopDataPlane();
     if (this._core) this._core.abort();
     else void this._proxy?.invoke("abort").catch(() => { /* rollback is best-effort */ });
+  }
+
+  /**
+   * Stop the Shell-owned data plane (mic + binary audio channel) and clear the
+   * live flag. Idempotent — `MicCapture.stop()` and `_closeAudio()` both no-op
+   * when already torn down — so a deliberate stop()/abort() and the subsequent
+   * `recognizing→false` listener cannot double-tear-down.
+   */
+  private _stopDataPlane(): void {
+    this._dataPlaneLive = false;
+    this._mic?.stop();
+    this._closeAudio();
   }
 
   /** Active streaming codec: the cached `codec` input, defaulting to the Core default. */
   private _resolveCodec(): string {
     const c = this._inputCache.codec;
-    return c ? String(c) : "LSB16K";
+    return c ? String(c) : DEFAULT_CODEC;
   }
 
   async stop(): Promise<void> {
-    this._mic?.stop();
-    this._closeAudio();
+    this._stopDataPlane();
     try {
       if (this._core) await this._core.stop();
       else await this._proxy?.invoke("stop");
@@ -217,8 +271,7 @@ export class AmiVoice extends HTMLElement {
   }
 
   abort(): void {
-    this._mic?.stop();
-    this._closeAudio();
+    this._stopDataPlane();
     if (this._core) this._core.abort();
     else void this._proxy?.invoke("abort").catch((e) => this._setError(normaliseError(e)));
   }
@@ -229,8 +282,7 @@ export class AmiVoice extends HTMLElement {
     // live session internally, so we deliberately do not also round-trip a
     // separate abort (the relay path would otherwise send abort + reset for a
     // single user action).
-    this._mic?.stop();
-    this._closeAudio();
+    this._stopDataPlane();
     if (this._core) this._core.reset();
     else void this._proxy?.invoke("reset").catch((e) => this._setError(normaliseError(e)));
   }
@@ -337,6 +389,24 @@ export class AmiVoice extends HTMLElement {
 
   private async _startMicRemote(session: unknown): Promise<void> {
     const sessionId = typeof session === "string" ? session : String(session ?? "");
+    // An empty id means the server-side Core refused to (re-)start — e.g. a
+    // re-entrant start() while a session is already live (its guard returns
+    // null). The server deliberately treated this as a no-op to PROTECT the live
+    // session, so we must NOT throw here: a throw would propagate to start()'s
+    // catch → `_rollbackStart()` → `invoke("abort")` and tear down the very
+    // session the server kept alive (latent edge b). Surface a benign,
+    // non-destructive notice and leave the existing session untouched. We also
+    // do not open an audio channel with an empty token (it would route nowhere).
+    if (!sessionId) {
+      this._dataPlaneLive = false;
+      this._setError(normaliseError(
+        new AmiVoiceError("c", "start() ignored: a recognition session is already active"),
+      ));
+      return;
+    }
+    // Close any prior audio channel before opening a new one so a re-`start()`
+    // does not orphan the previous socket.
+    this._closeAudio();
     // Audio rides the SEPARATE binary channel, never the JSON proxy
     // (docs/adr/0003). Default the audio URL to the control URL; deployments may
     // point it elsewhere. A failure here propagates to `start()`'s catch, which
@@ -355,6 +425,11 @@ export class AmiVoice extends HTMLElement {
 
   private async _startMic(onFrame: (bytes: Uint8Array) => void): Promise<void> {
     if (!this._mic) this._mic = new MicCapture();
+    // `_dataPlaneLive` is already claimed synchronously in `start()` (before any
+    // await), so we deliberately do NOT re-assert it here: a `recognizing→false`
+    // that raced the start await cleared the flag (and `MicCapture` is now
+    // cancellation-aware), so re-arming a torn-down data plane would leak a live
+    // mic with no session (latent edge a).
     await this._mic.start({
       onFrame,
       onLevel: (level) => { this._level = level; if (this._levelGate()) this._emit("level", level); },
@@ -370,9 +445,10 @@ export class AmiVoice extends HTMLElement {
   }
 
   private _teardown(): void {
-    this._mic?.stop();
+    this.removeEventListener("ami-voice:recognizing-changed", this._onRecognizingChanged);
+    this.removeEventListener("ami-voice:error", this._onError);
+    this._stopDataPlane();
     this._mic = null;
-    this._closeAudio();
     this._unbind?.();
     this._unbind = null;
     this._proxy?.dispose();

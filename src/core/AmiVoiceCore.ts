@@ -4,11 +4,12 @@ import {
 } from "../types.js";
 import type {
   WcsAmiVoiceAnyError, AmiVoiceCodec, AmiVoiceEngine,
-  AmiVoiceTransport, DirectSessionInfo, SpeakerSegment,
+  AmiVoiceTransport, DirectSessionInfo, DirectMintOptions, SpeakerSegment,
 } from "../types.js";
 import { normaliseError } from "../normaliseError.js";
 import { AmiVoiceError } from "../errorCodes.js";
 import { toSpeakerSegment } from "../speakerView.js";
+import { DEFAULT_CODEC } from "../audio/pcmEncoder.js";
 
 /** Observable outputs Core publishes, paired with `ami-voice:<name>-changed`. */
 const CORE_PROPERTY_NAMES = [
@@ -93,12 +94,20 @@ export class AmiVoiceCore extends EventTarget {
    */
   private readonly _transport: AmiVoiceTransport;
   /** Per-session mint options (direct mode); the server helper supplies the peer `ipa`. */
-  private readonly _mintOptions?: () => { ipa?: string; epi?: number };
+  private readonly _mintOptions?: () => DirectMintOptions;
   private _session: IRealtimeSession | null = null;
+  /**
+   * Bumped by every teardown (`abort`/`reset`/`_teardownSession`). `start()`
+   * captures it before `await openRealtimeSession` and re-checks it after: if a
+   * teardown intervened during the handshake, the just-opened session is released
+   * instead of being resurrected with `recognizing/connected=true`. Mirrors the
+   * generation pattern `MicCapture` uses for the same disconnect-during-start race.
+   */
+  private _sessionGeneration = 0;
 
   // inputs
   private _engine: AmiVoiceEngine = "-a-general";
-  private _codec: AmiVoiceCodec = "LSB16K";
+  private _codec: AmiVoiceCodec = DEFAULT_CODEC;
   private _profileId = "";
   private _profileWords = "";
   private _keepFillerToken = false;
@@ -129,7 +138,7 @@ export class AmiVoiceCore extends EventTarget {
     options?: {
       mintSessionId?: () => string;
       transport?: AmiVoiceTransport;
-      mintOptions?: () => { ipa?: string; epi?: number };
+      mintOptions?: () => DirectMintOptions;
     },
   ) {
     super();
@@ -219,6 +228,9 @@ export class AmiVoiceCore extends EventTarget {
   }
 
   private _teardownSession(): void {
+    // Invalidate any in-flight `start()` handshake so a session resolving AFTER
+    // this teardown is released rather than resurrected (abort/disconnect race).
+    this._sessionGeneration++;
     this._session = null;
     this._setRecognizing(false);
     this._setConnected(false);
@@ -244,6 +256,12 @@ export class AmiVoiceCore extends EventTarget {
     if (this._recognizing || this._loading) return null;
     this._setError(null);
     this._setLoading(true);
+    // Capture the teardown generation BEFORE the handshake await. `abort()` /
+    // `reset()` (e.g. a disconnectedCallback racing start()) bump it via
+    // `_teardownSession()`; if it changed by the time the session resolves, the
+    // caller asked to stop — release the freshly-opened session rather than
+    // resurrect it as `recognizing=true` with an orphaned upstream socket.
+    const generation = this._sessionGeneration;
     try {
       if (this._transport === "direct") {
         if (!this._provider.prepareDirectSession) {
@@ -251,7 +269,13 @@ export class AmiVoiceCore extends EventTarget {
         }
         return await this._provider.prepareDirectSession(this._currentOptions(), this._mintOptions?.());
       }
-      this._session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers());
+      const session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers());
+      if (generation !== this._sessionGeneration) {
+        // A teardown intervened during the handshake; drop the orphaned session.
+        session.abort();
+        return null;
+      }
+      this._session = session;
       this._setConnected(true);
       this._setRecognizing(true);
       return this._mintSessionId ? this._mintSessionId() : null;
@@ -268,7 +292,17 @@ export class AmiVoiceCore extends EventTarget {
   /** Graceful stop: flush remaining audio, await the trailing final result. */
   async stop(): Promise<void> {
     const session = this._session;
-    if (!session) return;
+    if (!session) {
+      // A stop() during the connect handshake (before `_session` is set) is NOT a
+      // no-op: a graceful flush is meaningless for a session that has not yet
+      // connected/streamed, but the request to stop must still INVALIDATE the
+      // in-flight handshake. Bump the generation (via `_teardownSession`) so the
+      // resolving start() takes its generation-mismatch branch and aborts the
+      // just-opened session instead of resurrecting it as `recognizing=true` with
+      // an orphaned upstream socket (mirrors abort()/reset() mid-handshake).
+      if (this._loading) this._teardownSession();
+      return;
+    }
     try {
       await session.stop();
     } catch (err) {
@@ -299,8 +333,18 @@ export class AmiVoiceCore extends EventTarget {
   async recognizeFile(audio: Blob | Uint8Array): Promise<RecognitionSegment[]> {
     this._setError(null);
     this._setLoading(true);
+    // Capture the teardown generation BEFORE the (possibly long: async-job poll)
+    // await, mirroring start()'s handshake guard. If `reset()` / `abort()` runs
+    // while the provider call is in flight it bumps the generation and clears the
+    // accumulated state; without this check the resolving recognizeFile() would
+    // re-append the just-fetched segments onto the state the consumer reset away.
+    const generation = this._sessionGeneration;
     try {
       const segments = await this._provider.recognizeFile(audio, this._currentOptions());
+      // A teardown intervened during the await; the consumer asked for a clean
+      // slate — drop the stale file results rather than repopulate the cleared
+      // transcript/segments/speakers/confidence.
+      if (generation !== this._sessionGeneration) return [];
       for (const seg of segments) this._appendFinal(seg);
       return segments;
     } catch (err) {

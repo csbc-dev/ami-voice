@@ -22,6 +22,14 @@ export class MicCapture {
   private _ctx: AudioContext | null = null;
   private _node: AudioWorkletNode | null = null;
   private _source: MediaStreamAudioSourceNode | null = null;
+  /**
+   * Bumped by every `stop()`. `start()` captures the current value and re-checks
+   * it after each `await`, so a `stop()` that races an in-flight `start()` WINS:
+   * `getUserMedia` (or `addModule`) is past its guard once it resolves, but the
+   * generation mismatch lets `start()` release the freshly obtained device
+   * instead of arming a live mic the Shell already tore down (latent edge a).
+   */
+  private _generation = 0;
 
   async start(handlers: MicCaptureHandlers): Promise<void> {
     if (this._ctx) return;
@@ -29,8 +37,16 @@ export class MicCapture {
     if (!mediaDevices?.getUserMedia) {
       raiseError("getUserMedia is unavailable; mic capture requires a secure browser context");
     }
+    const generation = this._generation;
 
     const stream = await mediaDevices.getUserMedia({ audio: true });
+    // A `stop()` interleaved with the pending `getUserMedia` already ran (it
+    // bumped `_generation` and nulled the fields). Release this just-granted
+    // device and bail rather than build a live capture graph with no session.
+    if (generation !== this._generation) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     this._stream = stream;
 
     const ctx = new AudioContext();
@@ -43,6 +59,17 @@ export class MicCapture {
       await ctx.audioWorklet.addModule(blobUrl);
     } finally {
       URL.revokeObjectURL(blobUrl);
+    }
+    // A `stop()` during `addModule` likewise wins: tear down what we built here.
+    if (generation !== this._generation) {
+      this._stream?.getTracks().forEach((track) => track.stop());
+      // A racing stop() may already have closed THIS ctx (it targets the same
+      // field), so close() can reject with InvalidStateError on an already-closed
+      // context — swallow it rather than leak an unhandled rejection.
+      void ctx.close().catch(() => { /* already closing */ });
+      this._stream = null;
+      this._ctx = null;
+      return;
     }
 
     const node = new AudioWorkletNode(ctx, PCM_WORKLET_NAME);
@@ -65,13 +92,16 @@ export class MicCapture {
   }
 
   stop(): void {
+    // Win any in-flight start(): a start() awaiting getUserMedia/addModule will
+    // see this bumped generation after its await and release the device.
+    this._generation++;
     if (this._node) {
       this._node.port.onmessage = null;
       this._node.disconnect();
     }
     this._source?.disconnect();
     this._stream?.getTracks().forEach((track) => track.stop());
-    void this._ctx?.close();
+    void this._ctx?.close().catch(() => { /* already closing */ });
     this._node = null;
     this._source = null;
     this._stream = null;

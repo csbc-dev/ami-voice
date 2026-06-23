@@ -113,6 +113,40 @@ describe("runRealtimeSession — upstream reconnect policy (3.1 / Q3)", () => {
     expect(h.calls.error).toBeUndefined();
     expect(h.calls.close).toHaveLength(1);
   });
+
+  it("stop() resolves the moment the socket closes, not on the fallback timer", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    // A long fallback timeout: if stop() only settled via the timer, this would
+    // not resolve for ~1 min. The onclose-settle wiring resolves it immediately.
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+
+    const stopped = session.stop();
+    expect(fake.sent).toContain("e");
+    fake.drop(); // server closes after `e` without an explicit `e` ack
+    await stopped; // resolves now, not after 60s
+
+    expect(h.calls.error).toBeUndefined();
+    expect(h.calls.close).toHaveLength(1);
+  });
+
+  it("a second concurrent stop() joins the first and both settle on the e-ack (no fallback delay)", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    // Long fallback: if the first stop()'s settle hook were orphaned by the
+    // second, p1 would hang until ~60s rather than resolving on the e-ack.
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+
+    const p1 = session.stop();
+    const p2 = session.stop(); // second stop while the first is in flight
+    expect(p2).toBe(p1);       // idempotent: same in-flight promise, no re-arm
+
+    fake.recv("e"); // single e-ack settles the (single) graceful stop
+    await Promise.all([p1, p2]);
+
+    expect(h.calls.error).toBeUndefined();
+    expect(h.calls.close).toHaveLength(1); // socket closed exactly once
+  });
 });
 
 describe("runRealtimeSession — event routing", () => {
@@ -156,5 +190,117 @@ describe("runRealtimeSession — event routing", () => {
     fake.open();
     fake.onerror?.(new Error("boom"));
     await expect(p).rejects.toThrow(/boom/);
+  });
+
+  it("routes an after-start socket error to onError WITHOUT rejecting", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+
+    fake.onerror?.(new Error("mid-stream"));
+
+    expect(h.calls.error).toHaveLength(1);
+    expect((h.calls.error[0][0] as Error).message).toMatch(/mid-stream/);
+    // The session promise already resolved at start; the error did not reject it.
+    expect(session).toHaveProperty("feedAudio");
+  });
+
+  it("settles stop() even if socket.send('e') throws", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    fake.send = () => { throw new Error("send failed"); };
+
+    // The send-throw fallback must settle the stop, not hang or reject.
+    await expect(session.stop()).resolves.toBeUndefined();
+    expect(h.calls.close).toHaveLength(1);
+  });
+});
+
+describe("runRealtimeSession — start-rejection classification (Q7/Q8)", () => {
+  it("classifies an s-command rejection as retryable/unknown, not auth", async () => {
+    const fake = new FakeSocket();
+    const p = runRealtimeSession(fake, START, handlers(), 5000);
+    fake.open();
+    fake.recv("s recognizer server is busy"); // non-auth rejection (free-text)
+    // AmiVoice rejects `s` for many non-auth reasons; the loop must not assert
+    // `auth`/non-retryable. Neutral `unknown` code, retryable, message preserved.
+    const err = await p.catch((e) => e as AmiVoiceError);
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err.code).toBe("unknown");
+    expect(err.retryable).toBe(true);
+    expect(err.message).toMatch(/recognizer server is busy/);
+    // A protocol-level `s` rejection has no follow-up close, so the loop must
+    // close the socket itself — otherwise each rejected start orphans a live WSS.
+    expect(fake.closed).toBe(true);
+  });
+});
+
+/** Like FakeSocket but `close()` defers `onclose` (real sockets fire it async). */
+class AsyncCloseSocket extends FakeSocket {
+  close(): void { if (this.closed) return; this.closed = true; /* onclose fires later via fireClose() */ }
+  fireClose(): void { this.onclose?.(); }
+}
+
+describe("runRealtimeSession — late s-ack after settle (async close window)", () => {
+  it("a late ok s-ack arriving after a connect-timeout reject does not flip started or fire a spurious drop", async () => {
+    const fake = new AsyncCloseSocket();
+    const h = handlers();
+    // Connect-timeout rejects and calls close() (which here does NOT fire onclose yet).
+    const p = runRealtimeSession(fake, START, h, 5000, /* connectTimeoutMs */ 5);
+    fake.open();
+    const err = await p.catch((e) => e as AmiVoiceError);
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err.message).toMatch(/within 5ms/);
+
+    // In the async close window a late ok `s`-ack still arrives at onmessage.
+    fake.recv("s");
+    // Then the deferred onclose finally runs.
+    fake.fireClose();
+
+    // The late ack must NOT have flipped `started`, so no "connection lost
+    // mid-session" error and no onClose for a session that never started.
+    expect(h.calls.error).toBeUndefined();
+    expect(h.calls.close).toBeUndefined();
+  });
+});
+
+describe("runRealtimeSession — connect/ack deadline", () => {
+  it("rejects when the s-ack never arrives within connectTimeoutMs", async () => {
+    const fake = new FakeSocket();
+    // Open the socket but never deliver the `s` ack and never close.
+    const p = runRealtimeSession(fake, START, handlers(), 5000, /* connectTimeoutMs */ 5);
+    fake.open();
+    const err = await p.catch((e) => e as AmiVoiceError);
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err.code).toBe("upstream");
+    expect(err.message).toMatch(/within 5ms/);
+    expect(fake.closed).toBe(true); // the stalled socket is closed
+  });
+
+  it("does NOT fire the connect deadline once the session has started", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    await startSession(fake, h, 5000); // s-ack arrives → timer cleared
+    // Wait past a short deadline window; nothing should error/close.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(h.calls.error).toBeUndefined();
+    expect(fake.closed).toBe(false);
+  });
+});
+
+describe("runRealtimeSession — e-ack error handling", () => {
+  it("surfaces a non-ok e ack as onError but still settles the graceful stop", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+
+    const stopped = session.stop();
+    expect(fake.sent).toContain("e");
+    fake.recv("e failed to finalize"); // error e-ack
+    await expect(stopped).resolves.toBeUndefined(); // stop still settles
+
+    expect(h.calls.error).toHaveLength(1);
+    expect((h.calls.error[0][0] as AmiVoiceError).message).toMatch(/failed to finalize/);
   });
 });

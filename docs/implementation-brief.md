@@ -2,26 +2,26 @@
 
 このブリーフは、散在する根拠（[ADR](adr/) = *なぜ* / [SPEC.md](../SPEC.md) = *なに* / [implementation-plan.md](implementation-plan.md) = *いつ・どの順* / [implementation-notes.md](implementation-notes.md) = 未決の *どう*）を、**残作業1本ぶん**の実装指示に畳み込んだもの。新しい決定はしていない（既存決定の追跡可能な再構成）。各項目は網羅を優先したため概要寄り。矛盾が出たら **ADR / SPEC が正**。
 
-> **対象スコープ**: 残作業すべて。Phase 0（足場＋リレー単体実装）は完了済み（build clean / unit 44 + integration 2 = green、2026-06-23 時点で再現確認済み）。
+> **対象スコープ**: 残作業すべて。Phase 0–3（足場＋リレー＋直結＋ハードニング）は完了済み（build clean / unit 154 + integration 3 + Playwright 2 = green、2026-06-23 時点で再現確認済み）。
 
 ---
 
 ## 0. 現状の真実（着手前提）
 
-`CLAUDE.md` の「Release readiness note」（provider stubbed / 26 tests）は**古い**。実態は [SPEC.md §23](../SPEC.md) と [implementation-plan.md](implementation-plan.md) が正しい。
+> **注**: 本 §0 は relay/direct/Phase 3 完了前の旧版。確定状態は [CLAUDE.md「Implementation status」](../CLAUDE.md) / [SPEC.md §23](../SPEC.md) / [implementation-plan.md](implementation-plan.md) が正本（矛盾時はそちら）。実態は relay + direct 両トランスポート＋Phase 3 ハードニングまで実装・テスト緑。
 
 | 既に実装済み（テスト緑） | 場所 |
 |---|---|
 | バインダブル面・Core 状態機械・target injection | [src/core/AmiVoiceCore.ts](../src/core/AmiVoiceCore.ts) |
 | `s`/`p`/`e` ビルダ + `S/E/C/U/A/G` パーサ | [src/protocol/wnnProtocol.ts](../src/protocol/wnnProtocol.ts) |
 | PCM ダウンサンプル / `LSB16K` フレーミング / level | [src/audio/pcmEncoder.ts](../src/audio/pcmEncoder.ts) |
-| Shell（local/remote・二チャネル配線・back-pressure・level throttle） | [src/components/AmiVoice.ts](../src/components/AmiVoice.ts) |
+| Shell（local/relay/direct・二チャネル配線・back-pressure・level throttle） | [src/components/AmiVoice.ts](../src/components/AmiVoice.ts) |
 | Provider リアルタイム WSS ループ（socket 注入可）・`recognizeFile`（async v2）・`issueOneTimeAppKey` | [src/providers/AmiVoiceProvider.ts](../src/providers/AmiVoiceProvider.ts) |
 | エラーコード正規化（閉じた union + retryable） | [src/errorCodes.ts](../src/errorCodes.ts) |
 | リレーサーバ補助（control + 音声 + セッション表） | [src/createAmiVoiceServer.ts](../src/createAmiVoiceServer.ts) |
 | Node フルスタック e2e・例サーバ・ユーザ README | [tests/integration/relay.e2e.test.ts](../tests/integration/relay.e2e.test.ts) / [examples/relayServer.mjs](../examples/relayServer.mjs) / README.md |
 
-**まだ無い**: ① 実ブラウザ Playwright ハーネス（Phase 1 唯一の残り）、② ブラウザ直結モード `transport="direct"`（Phase 2、未着手・seam だけ存在）、③ ハードニング（再接続 / コーデック拡張 / セキュリティプロファイル / ロギング / カバレッジ / 公開準備、Phase 3）。
+**まだ無い**: ① 実 AmiVoice スモークラン（有料 APPKEY、`AMIVOICE_APPKEY` gated）、② ユーザ手動リリース（version bump + `npm publish`）。①②以外（実ブラウザ Playwright ハーネス、直結モード `transport="direct"`、Phase 3 ハードニング）は実装・テスト緑。自動再接続と telephony コーデックは将来拡張として保留。
 
 ---
 
@@ -30,7 +30,7 @@
 実装が満たすべき確定仕様。すべて [SPEC.md](../SPEC.md) と [ADR](adr/) に既出。**変えない**。
 
 1. **コンポーネントは1つの権威タグ `<ami-voice>`（class `WcsAmiVoice`）**。input/command はすべてここ。子タグは追加しても projection 専用（SPEC §5, [ADR 0004](adr/0004-bindable-surface.md)）。
-2. **バインダブル面（SPEC §7）は公開契約で不変**。プロパティ `recognizing / connected / transcript / interim / segments / confidence / loading / error / level / mode`、input 8種（`engine / codec / profileId / profileWords / keepFillerToken / resultUpdatedInterval / segmenterProperties / noLog`）、command `start(async) / stop(async) / abort / reset`。イベント名は `ami-voice:<name>-changed`、ただし `error` だけ無サフィックスの signal `ami-voice:error`。
+2. **バインダブル面（SPEC §7）は公開契約で不変**。プロパティ `recognizing / connected / transcript / interim / segments / speakers / confidence / loading / error / level / mode`、input 8種（`engine / codec / profileId / profileWords / keepFillerToken / resultUpdatedInterval / segmenterProperties / noLog`）、command `start(async) / stop(async) / abort / reset`。イベント名は `ami-voice:<name>-changed`、ただし `error` だけ無サフィックスの signal `ami-voice:error`。
 3. **`transcript`（確定・`A`由来）と `interim`（仮説・`U`由来）は別プロパティで併合禁止。`confidence` は確定のみ（`U` から更新禁止）**（SPEC §7.1/§8）。
 4. **APPKEY はサーバ常駐**。`AMIVOICE_APPKEY` から読み、wcBindable input / 属性 / クライアントバンドル / ログのいずれにも出さない（SPEC §14, [ADR 0002](adr/0002-appkey-residency-and-remote-first.md)）。
 5. **リアルタイムは二チャネルリレーが既定**: JSON control（`@wc-bindable/remote`）＋ 別 binary WebSocket（音声、browser→server のみ）。音声を control に base64 で載せない。セッション id で相関し、token は `Sec-WebSocket-Protocol` で運ぶ（SPEC §11, [ADR 0003](adr/0003-realtime-audio-transport.md)）。
@@ -72,7 +72,7 @@
 - **3.3 コーデック拡張（Q9・gated）**: telephony が要件化したら `8K`＋`MULAW`/`ALAW` を [pcmEncoder.ts](../src/audio/pcmEncoder.ts) に追加。Shell は未対応 `codec` を**拒否**。
 - **3.4 デプロイ時セキュリティプロファイル**: auth-before-shell・per-command 認可・rate limit・音声 token を `Sec-WebSocket-Protocol`・`JsonValue` リソース上限を、ドキュメント＋例で示す（SPEC §14, [ADR 0002](adr/0002-appkey-residency-and-remote-first.md)）。例サーバの `TODO(auth)` プレースホルダを実装ガイドに昇格。
 - **3.5 構造化ロギング**: server helper に注入可能な `Logger`（connection open/close、拒否フレーム、emit したエラー）。
-- **3.6 カバレッジ & 公開準備**: カバレッジゲート、README/SPEC のバージョン参照確定、**`CLAUDE.md` の古い「Release readiness note」を実態に更新**、version bump、[release skill](../.claude/skills/release/SKILL.md) で公開（`@wc-bindable/*` が `^0.8.0`・`file:` 依存なしを確認）。`npm publish` は**ユーザが手動**で行う（Claude は実行しない）。
+- **3.6 カバレッジ & 公開準備**: カバレッジゲート、README/SPEC のバージョン参照確定、**`CLAUDE.md`「Implementation status」を実態に整合**、version bump、[release skill](../.claude/skills/release/SKILL.md) で公開（`@wc-bindable/*` が `^0.8.0`・`file:` 依存なしを確認）。`npm publish` は**ユーザが手動**で行う（Claude は実行しない）。
 
 ---
 
@@ -179,7 +179,7 @@
   - *unit*（`__tests__`, happy-dom, `npm test`）: 純ロジック（protocol/encoder/errorCodes/flowControl）＋ Core 状態機械＋契約。direct の token フロー・`realtimeSocket` パースもここに足す。
   - *integration*（`tests/integration`, `test:integration`）: 実 `ws` ソケットで client proxy ↔ relay ↔ fake。direct も Node 段で token→直結→`interim`/`transcript` を足す。
   - *e2e*（`tests/e2e`, Playwright・新規）: 実 Chromium ＋ fake audio device で mic/AudioWorklet/DOM の**データプレーンと相関**。relay と direct の両シナリオ。
-- **退行ガード**: 既存 44 unit + 2 integration は常時緑を維持。リレー経路と二チャネル相関のリジェクト検証を壊さない（§6-5/6）。
+- **退行ガード**: 既存の unit/integration スイートは常時緑を維持（正確な件数は CLAUDE.md「Implementation status」が正）。リレー経路と二チャネル相関のリジェクト検証を壊さない（§6-5/6）。
 - **契約テスト不変**: [amiVoiceWcBindableContract.test.ts](../__tests__/amiVoiceWcBindableContract.test.ts) が name/event 規約を固定。直結追加でこの assert を変えないこと（= 面が同一の証拠）。
 - **AudioWorklet クロスブラウザ**: 最低 Chromium で通す。Safari/Firefox 差は見つけ次第ノート化（plan Risks）。
 - **AmiVoice エラーコード**: client-error 部分集合の非リトライ判定（[errorCodes.test.ts](../__tests__/errorCodes.test.ts)）を direct 側でも共有（並行コードパス禁止、ADR 0006 rule 3）。
@@ -199,7 +199,7 @@
 ### Phase 3 exit / リリース可
 - 再接続（Q3）・必要なコーデック（Q9）・diarization 方針（Q6）が決定済み（gated は「非対応を明記」でも可）。
 - デプロイ時セキュリティプロファイルと注入ロギングがドキュメント＋例で提示済み。
-- カバレッジゲート通過。`CLAUDE.md`/`SPEC.md`/README のバージョン・状態記述が実態と整合（特に古い「Release readiness note」更新済み）。
+- カバレッジゲート通過。`CLAUDE.md`/`SPEC.md`/README のバージョン・状態記述が実態と整合（特に `CLAUDE.md`「Implementation status」が実態どおり）。
 - マニフェストが publishable（`@wc-bindable/*` が `^0.8.0` semver、`file:` 依存なし）。`npm run build` クリーン。**`npm publish` はユーザが手動実行**（[release skill](../.claude/skills/release/SKILL.md)）。
 
 ---

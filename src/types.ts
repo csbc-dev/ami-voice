@@ -184,6 +184,17 @@ export interface DirectSessionInfo {
   sCommand: string;
 }
 
+/**
+ * One-time-APPKEY mint parameters (direct mode, docs/adr/0006). `ipa` binds the
+ * minted token to the peer source address; `epi` is its expiry in seconds.
+ */
+export interface DirectMintOptions {
+  /** Peer source address to IP-restrict the one-time APPKEY (`ipa`). */
+  ipa?: string;
+  /** One-time-APPKEY expiry in seconds (`epi`). */
+  epi?: number;
+}
+
 /** A live realtime session the Core feeds audio into. */
 export interface IRealtimeSession {
   /** Push one already-framed audio chunk (PCM/companded bytes) to AmiVoice. */
@@ -218,7 +229,7 @@ export interface IAmiVoiceProvider {
    */
   prepareDirectSession?(
     options: RecognitionOptions,
-    mintOptions?: { ipa?: string; epi?: number },
+    mintOptions?: DirectMintOptions,
   ): Promise<DirectSessionInfo>;
 }
 

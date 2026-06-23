@@ -31,9 +31,13 @@ The intended surface:
 
 | Kind | Names |
 |---|---|
-| properties | `recognizing`, `connected`, `transcript`, `interim`, `segments`, `confidence`, `level`, `loading`, `error`, `mode` |
-| inputs | `engine` / `grammarFileNames`, `codec`, `profileId`, `profileWords`, `keepFillerToken`, `resultUpdatedInterval`, `segmenterProperties`, `noLog`, `remoteUrl` |
+| properties | `recognizing`, `connected`, `transcript`, `interim`, `segments`, `speakers`, `confidence`, `level`, `loading`, `error`, `mode` |
+| inputs | `engine` / `grammarFileNames`, `codec`, `profileId`, `profileWords`, `keepFillerToken`, `resultUpdatedInterval`, `segmenterProperties`, `noLog` |
 | commands | `start` (async), `stop`, `abort` / `reset` |
+
+(`remoteUrl` is a deployment **attribute** (`remote-url`), not a wcBindable input — see SPEC §7.2 and `CORE_INPUT_NAMES`.)
+
+(`speakers` was added later by [ADR 0007](0007-diarization-speaker-view.md) as a derived, final-only projection of `segments`; it is listed here to keep this table in sync with CLAUDE.md §3 per follow-up rule 5.)
 
 Command notes:
 

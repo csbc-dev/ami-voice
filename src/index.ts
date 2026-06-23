@@ -31,10 +31,11 @@ export { shouldSendFrame, createRateLimiter, DEFAULT_MAX_AUDIO_BUFFER } from "./
 export { toSpeakerSegment, speakerLabelOf } from "./speakerView.js";
 
 export type {
+  IConfig, ITagNames, IRemoteConfig,
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig,
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers,
   RecognitionOptions, RecognitionSegment, RecognitionToken, InterimResult, SpeakerSegment,
-  AmiVoiceCodec, AmiVoiceEngine, AmiVoiceTransport, DirectSessionInfo,
+  AmiVoiceCodec, AmiVoiceEngine, AmiVoiceTransport, DirectSessionInfo, DirectMintOptions,
   SerializedError, WcsAmiVoiceAnyError,
   AmiVoiceCoreValues, AmiVoiceValues,
 } from "./types.js";

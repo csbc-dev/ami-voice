@@ -4,7 +4,7 @@ Sequenced delivery plan for `@csbc-dev/ami-voice`. Roles of the docs: [ADRs](.) 
 
 ## Current status — Phases 1 & 2 complete; Phase 3 hardening done
 
-Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 101 unit + 3 Node integration + 2 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
+Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 154 unit + 3 Node integration + 2 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
 
 - Bindable surface, Core state machine, target injection, `s`/`p`/`e` builder + `S/E/C/U/A/G` parser, PCM/`LSB16K` encoder, Shell (local/relay/direct, two-channel wiring), mic capture (browser-runtime).
 - Provider realtime WSS loop (injectable socket; shared `runRealtimeSession`), `recognizeFile` (async v2), one-time-APPKEY mint + `prepareDirectSession`, error-code normalization.
@@ -12,7 +12,7 @@ Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the
 - Browser-direct path (`src/components/realtimeSocket.ts`: `DirectBrowserProvider` + `openDirectRealtimeSession`) — the browser opens the AmiVoice WSS itself with a server-minted one-time key; audio bypasses the server.
 - Runnable single-port example (`examples/relayServer.mjs`) + a real-browser Playwright harness proving mic capture → interim → finalized transcript against a fake AmiVoice WSS, in BOTH transports.
 
-What does **not** exist yet: a real AmiVoice WSS run (needs a paid APPKEY; gated behind `AMIVOICE_APPKEY`) and the Phase 3 hardening/tuning decisions.
+What does **not** exist yet: a real AmiVoice WSS run (needs a paid APPKEY; gated behind `AMIVOICE_APPKEY`) and the user-driven release (version bump + `npm publish`).
 
 ## Guiding principles
 

@@ -1,4 +1,4 @@
-import { runRealtimeSession, type RealtimeSocket } from "../protocol/realtimeSession.js";
+import { runRealtimeSession, wrapWebSocket, type RealtimeSocket } from "../protocol/realtimeSession.js";
 import type {
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers,
   RecognitionSegment, DirectSessionInfo,
@@ -19,21 +19,12 @@ import type {
 /** Default graceful-stop fallback (mirrors the provider; Q4/D1). */
 const DEFAULT_STOP_TIMEOUT_MS = 5000;
 
-/** Wrap the platform `WebSocket` as a `RealtimeSocket` (browser realtime WSS). */
-export function browserRealtimeSocketFactory(url: string): RealtimeSocket {
-  const ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
-  const sock: RealtimeSocket = {
-    send: (d) => ws.send(d),
-    close: () => ws.close(),
-    onopen: null, onmessage: null, onclose: null, onerror: null,
-  };
-  ws.onopen = () => sock.onopen?.();
-  ws.onmessage = (e: MessageEvent) => { if (typeof e.data === "string") sock.onmessage?.(e.data); };
-  ws.onclose = () => sock.onclose?.();
-  ws.onerror = (e) => sock.onerror?.(e);
-  return sock;
-}
+/**
+ * Wrap the platform `WebSocket` as a `RealtimeSocket` (browser realtime WSS).
+ * Thin re-export of the shared adapter (relay + direct share one implementation,
+ * docs/adr/0006 rule 3); kept as a named export for the public API surface.
+ */
+export const browserRealtimeSocketFactory: (url: string) => RealtimeSocket = wrapWebSocket;
 
 export interface OpenDirectSessionOptions extends DirectSessionInfo {
   /** Injectable socket factory (default wraps the platform `WebSocket`). */

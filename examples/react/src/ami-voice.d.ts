@@ -1,5 +1,7 @@
 // Minimal local typings for the <ami-voice> custom element so the example is
 // self-contained (no cross-package type resolution needed for `vite build`).
+// An intentional per-example copy — mirrors the Vue `types.ts` and the Vanilla
+// inline interfaces (like the duplicated style.css; see shared/styles.css).
 import "react";
 
 export interface RecognitionSegment {

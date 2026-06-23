@@ -25,6 +25,8 @@ npm run build && AMIVOICE_APPKEY=your-key npm run example
 
 The server wires `@csbc-dev/ami-voice/server`'s `createAmiVoiceRelayServer` to your WebSocket server. **You MUST authenticate the peer before handing sockets to the relay** (see [SPEC.md §14](SPEC.md)).
 
+> `npm run example` is a **realtime-only** minimal relay (no file endpoint). For the framework examples (React / Vue / Vanilla / `@wcstack/state` / `@wcstack/signals`) and **file recognition**, run the superset server — `npm run examples:server` — and see [examples/README.md](examples/README.md).
+
 **2. Browser** — register the element and bind:
 
 ```html

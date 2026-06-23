@@ -32,7 +32,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join, normalize, extname } from "node:path";
+import { dirname, join, normalize, extname, sep } from "node:path";
 import { WebSocketServer } from "ws";
 import { WebSocketServerTransport } from "@wc-bindable/remote";
 import { createAmiVoiceRelayServer, AmiVoiceProvider, toSpeakerSegment } from "../../dist/server.js";
@@ -107,6 +107,12 @@ function readBody(req) {
   });
 }
 
+/** True iff `file` is `root` itself or genuinely nested under it (boundary-safe:
+ *  a bare startsWith would let ".../dist-evil" pass the ".../dist" check). */
+function under(file, root) {
+  return file === root || file.startsWith(root + sep);
+}
+
 /** Map a URL path to a file on disk under one of the allowed roots, or null. */
 function resolveStatic(urlPath) {
   // /vendor/ami-voice/** → the built package, mounted at the package ROOT so the
@@ -116,27 +122,30 @@ function resolveStatic(urlPath) {
     const rel = urlPath.slice("/vendor/ami-voice/".length);
     const file = normalize(join(PACKAGE_DIR, rel));
     const autoRoot = join(PACKAGE_DIR, "src", "auto");
-    return (file.startsWith(DIST_DIR) || file.startsWith(autoRoot)) ? file : null;
+    return (under(file, DIST_DIR) || under(file, autoRoot)) ? file : null;
   }
   // /vendor/signals/** → @wcstack/signals built dist (single shared core chunk).
   if (urlPath.startsWith("/vendor/signals/")) {
     const rel = urlPath.slice("/vendor/signals/".length);
     const file = normalize(join(SIGNALS_DIR, rel));
-    return file.startsWith(SIGNALS_DIR) ? file : null;
+    return under(file, SIGNALS_DIR) ? file : null;
   }
   // Everything else is served from examples/ (the buildless pages + shared css).
   const rel = urlPath === "/" ? "/index.html" : urlPath;
   const withIndex = rel.endsWith("/") ? rel + "index.html" : rel;
   const file = normalize(join(EXAMPLES_DIR, withIndex));
-  return file.startsWith(EXAMPLES_DIR) ? file : null;
+  return under(file, EXAMPLES_DIR) ? file : null;
 }
 
 async function handleRecognize(req, res) {
   const url = new URL(req.url, "http://localhost");
   const engine = url.searchParams.get("engine") || "-a-general";
-  const codec = url.searchParams.get("codec") || "16K";
   const noLog = url.searchParams.get("noLog") === "1";
-  const options = { engine, codec, noLog };
+  // The async file API auto-detects the audio format from the file header, so
+  // recognizeFile() ignores `codec` — it is set here only to satisfy
+  // RecognitionOptions. (Realtime is different: the browser streams headerless PCM
+  // and must declare LSB16K. That is why the clients have no file-codec knob.)
+  const options = { engine, codec: "16K", noLog };
   try {
     const body = await readBody(req);
     if (body.length === 0) {

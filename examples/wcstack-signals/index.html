@@ -97,7 +97,8 @@
     if (!file) return;
     fileLoading.set(true); fileError.set(""); fileResult.set(null);
     try {
-      const res = await fetch("/api/recognize?engine=-a-general&codec=16K", { method: "POST", body: file });
+      // No codec: the async file API auto-detects the format from the file header.
+      const res = await fetch("/api/recognize?engine=-a-general", { method: "POST", body: file });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || res.statusText);
       fileResult.set(data);
@@ -125,6 +126,7 @@
           ),
         ),
         h("div", { class: "meter" },
+          // 140 = meter gain: mic level (RMS ~0–0.7 for speech) → 0–100% bar width.
           h("span", { style: () => `width:${Math.min(100, Math.round(sig.level.get() * 140))}%` }),
         ),
         h("div", { class: "transcript" },

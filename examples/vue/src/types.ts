@@ -1,4 +1,6 @@
 // Minimal local typings for the <ami-voice> element (self-contained example).
+// An intentional per-example copy — mirrors the React `ami-voice.d.ts` and the
+// Vanilla inline interfaces (like the duplicated style.css; see shared/styles.css).
 export interface RecognitionSegment {
   text: string;
   confidence: number;

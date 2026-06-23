@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { useWcBindable } from "@wc-bindable/react";
 import type { AmiVoiceElement, AmiVoiceValues, RecognitionSegment } from "./ami-voice";
-import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC } from "./config";
+import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC, LEVEL_METER_GAIN } from "./config";
 
 function errMsg(e: unknown): string {
   if (!e) return "";
@@ -34,7 +34,7 @@ export function App() {
     setFileLoading(true); setFileError(""); setFileResult(null);
     try {
       const res = await fetch(
-        `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}&codec=16K`,
+        `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}`,
         { method: "POST", body: file },
       );
       const data = await res.json();
@@ -47,7 +47,7 @@ export function App() {
     }
   }, [file]);
 
-  const levelPct = Math.min(100, Math.round(ami.level * 140));
+  const levelPct = Math.min(100, Math.round(ami.level * LEVEL_METER_GAIN));
 
   return (
     <main>

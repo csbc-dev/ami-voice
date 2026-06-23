@@ -1,8 +1,10 @@
 import { bootstrapAmiVoice } from "@csbc-dev/ami-voice";
 import { bind } from "@wc-bindable/core";
-import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC } from "./config";
+import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC, LEVEL_METER_GAIN } from "./config";
 import "./style.css";
 
+// Local element typings — an intentional per-example copy (each example is
+// self-contained; mirrors the React `ami-voice.d.ts` / Vue `types.ts`).
 interface RecognitionSegment { text: string; confidence: number }
 interface AmiVoiceElement extends HTMLElement {
   start(): Promise<void>;
@@ -53,7 +55,7 @@ bind(ami, (name, value) => {
   switch (name) {
     case "transcript": transcriptEl.textContent = String(value ?? ""); break;
     case "interim": interimEl.textContent = value ? " " + value : ""; break;
-    case "level": levelEl.style.width = Math.min(100, Math.round(Number(value) * 140)) + "%"; break;
+    case "level": levelEl.style.width = Math.min(100, Math.round(Number(value) * LEVEL_METER_GAIN)) + "%"; break;
     case "recognizing": recognizing = Boolean(value); renderStatus(); break;
     case "connected": connected = Boolean(value); renderStatus(); break;
     case "segments": {
@@ -104,7 +106,7 @@ recognizeBtn.addEventListener("click", async () => {
   fileOut.hidden = true;
   try {
     const res = await fetch(
-      `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}&codec=16K`,
+      `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}`,
       { method: "POST", body: file },
     );
     const data = await res.json();

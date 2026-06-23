@@ -71,6 +71,7 @@
         return this["rec.recognizing"] ? "recognizing"
           : this["rec.connected"] ? "connected" : "idle";
       },
+      // 140 = meter gain: mic level (RMS ~0–0.7 for speech) → 0–100% bar width.
       get levelWidth() { return Math.min(100, Math.round(this["rec.level"] * 140)) + "%"; },
       get recognizeLabel() { return this.fileLoading ? "Recognizing…" : "Recognize"; },
 
@@ -87,7 +88,8 @@
         this.fileLoading = true; this.fileError = ""; this.fileShow = false;
         try {
           // Same origin as this page (served by the shared server) → relative URL.
-          const res = await fetch("/api/recognize?engine=-a-general&codec=16K", { method: "POST", body: file });
+          // No codec: the async file API auto-detects the format from the file header.
+          const res = await fetch("/api/recognize?engine=-a-general", { method: "POST", body: file });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || res.statusText);
           this.fileTranscript = data.transcript;

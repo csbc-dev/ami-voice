@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useWcBindable } from "@wc-bindable/vue";
 import type { AmiVoiceElement, AmiVoiceValues, RecognitionSegment } from "./types";
-import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC } from "./config";
+import { SERVER_HTTP, SERVER_WS, ENGINE, REALTIME_CODEC, LEVEL_METER_GAIN } from "./config";
 
 function errMsg(e: unknown): string {
   if (!e) return "";
@@ -16,7 +16,7 @@ const { ref: amiEl, values: ami } = useWcBindable<AmiVoiceElement, AmiVoiceValue
   segments: [], confidence: 0, level: 0, loading: false, error: null, mode: "remote",
 });
 
-const levelPct = computed(() => Math.min(100, Math.round(ami.level * 140)));
+const levelPct = computed(() => Math.min(100, Math.round(ami.level * LEVEL_METER_GAIN)));
 const statusLabel = computed(() =>
   ami.recognizing ? "recognizing" : ami.connected ? "connected" : "idle");
 
@@ -40,7 +40,7 @@ async function recognizeFile() {
   fileLoading.value = true; fileError.value = ""; fileResult.value = null;
   try {
     const res = await fetch(
-      `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}&codec=16K`,
+      `${SERVER_HTTP}/api/recognize?engine=${encodeURIComponent(ENGINE)}`,
       { method: "POST", body: file.value },
     );
     const data = await res.json();

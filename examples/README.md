@@ -118,3 +118,11 @@ examples/
 
 > Note: `examples/relayServer.mjs` (the package's `npm run example`) is the **minimal** relay-only
 > demo. `examples/shared/server.mjs` here is the fuller server these five clients share.
+
+## Bonus: wire speech into an LLM — [`voice-llm/`](voice-llm/)
+
+[`voice-llm/`](voice-llm/) is a standalone demo that pairs `<ami-voice>` with the sibling
+package `@csbc-dev/ai-agent` (`<ai-agent>`): mic → transcript → LLM summary, with **binding
+only**. Both Cores run server-side (one process holds both the AmiVoice APPKEY and the LLM key);
+the browser sees only state. It has its own combined server and runs fully offline with no
+credentials. See [`voice-llm/README.md`](voice-llm/README.md).

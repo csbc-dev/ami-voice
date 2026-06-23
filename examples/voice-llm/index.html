@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>&lt;ami-voice&gt; × &lt;ai-agent&gt; — 配線だけで音声 → LLM</title>
+  </head>
+  <body>
+    <main>
+      <h1>音声 → LLM を<em>配線だけ</em>で</h1>
+      <p class="lead">
+        <code>&lt;ami-voice&gt;</code> が話し言葉を文字起こしし、その確定テキストを
+        <code>&lt;ai-agent&gt;</code> の <code>prompt</code> に流して要約させます。
+        APPKEY も LLM の API キーもサーバに常駐し、ブラウザには一切出ません。
+      </p>
+      <div class="badges">
+        <span class="badge wc">&lt;ami-voice&gt;</span>
+        <span class="badge">+</span>
+        <span class="badge wc">&lt;ai-agent&gt;</span>
+        <span class="badge">@wc-bindable/core</span>
+      </div>
+
+      <!-- ── 音声認識（CSBC Case C：マイクはブラウザ、APPKEY はサーバ） ── -->
+      <section>
+        <h2>1. 話す（リアルタイム文字起こし）</h2>
+
+        <!-- Headless 要素。UI は持たない。transport="relay" で音声はサーバ経由。 -->
+        <div id="ami-host"></div>
+
+        <div class="row">
+          <button id="toggle">🎤 Start</button>
+          <button id="reset" class="ghost">Reset</button>
+          <span class="status">
+            <span id="dot" class="dot"></span>
+            <span id="status-label">idle</span>
+          </span>
+        </div>
+
+        <div class="meter"><span id="level"></span></div>
+
+        <div class="transcript">
+          <span id="transcript"></span><span id="interim" class="interim"></span>
+        </div>
+
+        <div id="rt-error" class="error" hidden></div>
+        <p class="muted">マイクを許可してください（Chrome 推奨）。<strong>Stop</strong> すると自動で LLM に渡します。</p>
+      </section>
+
+      <!-- ── 生成AI（CSBC Case B1：LLM キーはサーバ） ── -->
+      <section>
+        <h2>2. 要約させる（LLM）</h2>
+
+        <!-- Headless 要素。prompt をセットして send() するだけ。content が流れてくる。 -->
+        <div id="ai-host"></div>
+
+        <div class="row">
+          <label class="auto">
+            <input type="checkbox" id="auto" checked />
+            Stop で自動要約
+          </label>
+          <button id="summarize">この文字起こしを要約</button>
+          <span class="status">
+            <span id="ai-dot" class="dot"></span>
+            <span id="ai-status">idle</span>
+          </span>
+        </div>
+
+        <div class="answer">
+          <div id="answer" class="answer-body"></div>
+          <div id="answer-empty" class="muted">まだ要約はありません。話して Stop するか、ボタンを押してください。</div>
+        </div>
+
+        <div id="usage" class="usage" hidden></div>
+        <div id="ai-error" class="error" hidden></div>
+        <p class="muted" id="ai-mode"></p>
+      </section>
+
+      <p class="footer muted">
+        消えた配線：getUserMedia / AudioWorklet / WSS フレーミング / SSE パース /
+        トークン蓄積 / abort / 鍵管理。残ったのは「いつ LLM に投げるか」の一行だけ。
+      </p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

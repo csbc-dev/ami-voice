@@ -28,7 +28,9 @@ The recognition surface is identical everywhere — `transcript`, `interim`, `se
 
 ## Prerequisites
 
-Build the package once (the examples import the built `dist/`):
+The clients pull `@csbc-dev/ami-voice` from the public registry/CDN now (buildless pages from
+esm.run, the Vite apps from npm), so they need no local build. The **shared server** still imports
+the built `dist/server.js`, so build the package once before starting it:
 
 ```bash
 # from the repository root
@@ -71,8 +73,8 @@ npm run dev            # open the printed URL (e.g. http://localhost:5173)
 # npm run build        # production build into dist/  (this is the "build OK" check)
 ```
 
-Each build example links the package via `"@csbc-dev/ami-voice": "file:../.."`, so it resolves the
-local `dist/` you built in the prerequisites step.
+Each build example installs the published `@csbc-dev/ami-voice` from npm (`"latest"` in its
+`package.json`), so `npm install` pulls it like any other dependency — no link to the repo root.
 
 ## How the wiring works per client
 
@@ -89,19 +91,18 @@ local `dist/` you built in the prerequisites step.
 ### Buildless registration (no hand-written bootstrap)
 
 The two buildless pages register `<ami-voice>` with **no `bootstrapAmiVoice()` call** — just the
-`@csbc-dev/ami-voice/auto/remoteEnv` side-effect entry, which opts into remote/relay mode and reads
-the control URL from a global hook set inline first:
+`@csbc-dev/ami-voice/auto/remoteEnv` side-effect entry loaded from esm.run, which opts into
+remote/relay mode and reads the control URL from a global hook set inline first:
 
 ```html
 <script>globalThis.AMIVOICE_REMOTE_CORE_URL = `ws://${location.host}/`;</script>
-<script type="module" src="/vendor/ami-voice/src/auto/remoteEnv.js"></script>
+<script type="module" src="https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv"></script>
 ```
 
-`<ami-voice>` is served from this server because the package is **unpublished pre-release**, so
-`esm.run`/jsDelivr can't serve it yet. **After `npm publish`** both pages collapse to a CDN-only
-setup — point the entry at `https://esm.run/@csbc-dev/ami-voice/auto/remoteEnv` and drop the
-`/vendor` mount and the `@wc-bindable/*` importmap entries (esm.run resolves those deps itself).
-Each page's `<head>` marks the exact lines to change.
+esm.run resolves the package's own `@wc-bindable/*` deps, so the pages need no importmap for them —
+`wcstack-state` has none, and `wcstack-signals` keeps a tiny importmap only for its locally-served
+`@wcstack/signals` core (that one core must stay a single instance, so it can't come from a CDN).
+The shared server therefore no longer serves `<ami-voice>` itself; only `/vendor/signals/` remains.
 
 ## Layout
 
@@ -111,7 +112,7 @@ examples/
 │  ├─ server.mjs        relay WS + POST /api/recognize + static hosting (+ offline fake)
 │  ├─ fakeAmiVoice.mjs  in-process fake AmiVoice (realtime + file)
 │  └─ styles.css        shared styling
-├─ react/  vue/  vanilla/        Vite apps (file:../.. link to the package)
+├─ react/  vue/  vanilla/        Vite apps (install @csbc-dev/ami-voice from npm)
 └─ wcstack-state/  wcstack-signals/   buildless HTML, served by shared/
 ```
 

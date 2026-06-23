@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@csbc-dev/ami-voice": "file:../..",
+    "@csbc-dev/ami-voice": "latest",
     "@wc-bindable/core": "^0.8.0",
     "@wc-bindable/react": "^0.8.0",
     "@wc-bindable/remote": "^0.8.0",

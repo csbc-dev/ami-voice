@@ -13,7 +13,7 @@ published: false
 - [`@csbc-dev/ami-voice`](https://www.npmjs.com/package/@csbc-dev/ami-voice)（音声認識）と兄弟パッケージ [`@csbc-dev/ai-agent`](https://www.npmjs.com/package/@csbc-dev/ai-agent)（LLM）を、**バインディングだけ**でつなぎます。
 - マイクで話す → 文字起こし → その確定テキストをLLMに渡して要約。アプリ側に書くコードは「**いつLLMに投げるか**」の一行だけ。
 - `getUserMedia` / `AudioWorklet` / WebSocketフレーミング / SSEパース / トークン蓄積 / abort / **鍵管理** は、すべて2つのコンポーネントの中。APPKEYもLLMのAPIキーも**サーバから出ません**。
-- 動くデモ（鍵ゼロでもオフライン動作）のソースは [`examples/voice-llm/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm) にあります。
+- 動くデモ（鍵ゼロでもオフライン動作）のソースは [`examples/voice-llm-vue/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-vue)（この記事の例。Vue）にあります。Vanilla版 [`voice-llm/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm)・React版 [`voice-llm-react/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-react) も同梱です。
 
 ## 作るもの
 
@@ -77,45 +77,54 @@ static wcBindable = {
 
 ## 配線の実物
 
-`@wc-bindable/core` の `bind()` は「`el.constructor.wcBindable` を読んで、各プロパティの初期値を渡し、以後イベントで変更を流す」だけの約20行の関数です。フレームワーク非依存。これで両コンポーネントの状態をDOMに映します。
+状態をフロントに映す部分は、フレームワークアダプタに任せます。`@wc-bindable/vue` の `useWcBindable` は「`el.constructor.wcBindable` を読んで各プロパティをVueのリアクティブ状態に同期し、要素 ref でコマンドを呼ぶ」フックです（素のAPIは `@wc-bindable/core` の `bind()` という約20行のフレームワーク非依存関数で、各アダプタはその上に乗っています）。これで両コンポーネントの状態が、**手書きの射影なしで**そのままテンプレートへ流れ込みます。
 
-そして肝心の「音声→LLM」の配線は、これだけです。
+そして肝心の「音声→LLM」の配線は、`<script setup>` のこれだけです。
 
-```ts
+```vue
+<script setup lang="ts">
+import { watch } from "vue";
+import { useWcBindable } from "@wc-bindable/vue";
+
+// 各コンポーネントの状態をVueに同期（state→DOM の射影は手書きしない）
+const { ref: amiEl, values: ami } = useWcBindable(/* <ami-voice> の初期値 */);
+const { ref: aiEl,  values: aiv } = useWcBindable(/* <ai-agent> の初期値 */);
+
 // <ami-voice> の確定テキストを <ai-agent> の prompt に流して send() する
 function summarize() {
-  if (!transcript.trim()) return;
-  aiAgent.prompt = transcript;   // プロパティに代入して…
-  void aiAgent.send();           // …コマンドを呼ぶ。それだけ。
+  if (!ami.transcript.trim()) return;
+  aiEl.value!.prompt = ami.transcript;   // プロパティに代入して…
+  void aiEl.value!.send();               // …コマンドを呼ぶ。それだけ。
 }
 
-// 録音が止まったら（recognizing が true→false）一度だけ呼ぶ
-bind(ami, (name, value) => {
-  if (name === "transcript") transcript = String(value ?? "");
-  if (name === "recognizing") {
-    const stopped = prevRecognizing && !value;
-    prevRecognizing = Boolean(value);
-    if (stopped) summarize();    // ← アプリが書く“唯一の判断”
-  }
+// 録音が止まったら（recognizing が true→false）一度だけ呼ぶ ← アプリが書く“唯一の判断”
+watch(() => ami.recognizing, (now, prev) => {
+  if (prev && !now) summarize();
 });
+</script>
 ```
 
-`<ai-agent>` の応答も同じく `bind()` で受けるだけ。
+`<ami-voice>` の文字起こしも `<ai-agent>` の応答も、**`bind()` のスイッチや `createElement` を書かずに**、状態がそのままテンプレートに流れ込みます。
 
-```ts
-bind(aiAgent, (name, value) => {
-  if (name === "content") answerEl.textContent = String(value ?? ""); // ストリーミング表示
-});
+```vue
+<template>
+  <!-- ヘッドレス要素を宣言し、ref と属性で配線する -->
+  <ami-voice ref="amiEl" :remote-url="SPEECH_WS" transport="relay" :engine="ENGINE" :codec="CODEC" />
+  <ai-agent  ref="aiEl"  :provider="PROVIDER" :model="MODEL" />
+
+  <div class="transcript">{{ ami.transcript }}<span class="interim">{{ ami.interim }}</span></div>
+  <div class="answer">{{ aiv.content }}</div>   <!-- ストリーミング応答がそのまま映る -->
+</template>
 ```
 
-消えた配線を数えてみてください。マイク取得、`AudioWorklet`でのダウンサンプリングとPCMフレーミング、AmiVoiceの `s`/`p`/`e` コマンド送出と `S`/`E`/`C`/`U`/`A` イベントのパース、LLMのSSEストリーム解析、トークン蓄積、`AbortController`、そして**2つの秘密鍵の管理** —— アプリ側のコードには一切現れません。すべて2つのCoreの内側です。
+消えた配線を数えてみてください。マイク取得、`AudioWorklet`でのダウンサンプリングとPCMフレーミング、AmiVoiceの `s`/`p`/`e` コマンド送出と `S`/`E`/`C`/`U`/`A` イベントのパース、LLMのSSEストリーム解析、トークン蓄積、`AbortController`、そして**2つの秘密鍵の管理** —— アプリ側のコードには一切現れません。すべて2つのCoreの内側です。さらにこのVue版では、状態をDOMへ映す**手書きの射影（`bind()` のスイッチや `createElement`）も `useWcBindable` とテンプレートが肩代わり**するので、アプリに残るのは上の `watch` 一つだけです。
 
 ## サーバ：1プロセスに2つのCore（秘密が出ない構造）
 
 なぜ鍵が漏れないのか。両方のCoreを**サーバに置く**からです。1つのNodeプロセスで2つのチャンネルをホストします。
 
 ```js
-// examples/voice-llm/server.mjs（抜粋）
+// examples/voice-llm-vue/server.mjs（抜粋。3版とも同じサーバ設計）
 const relay = createAmiVoiceRelayServer({ createProvider });   // APPKEY常駐
 
 server.on("upgrade", (req, socket, head) => {
@@ -166,12 +175,14 @@ CSBCの兄弟パッケージを**合成する**ときの実地ノウハウです
 実際、初期の `@csbc-dev/ai-agent@0.1.0` は `@wc-bindable/* ^0.4` を向いていて、`@csbc-dev/ami-voice`（`^0.8`）とズレていました。当時はnpm aliasで両世代を入れ、チャンネルごとに使い分ける必要がありました。**`@csbc-dev/ai-agent@0.2.0` で `^0.8` に揃った**ので、今は単一の `@wc-bindable/remote` で両チャンネルをまかなえます。
 
 ```jsonc
-// package.json — 0.2.0 以降は単一バージョンでOK
+// package.json（Vue版）— 0.2.0 以降は単一バージョンでOK
 "dependencies": {
-  "@csbc-dev/ami-voice": "latest",
+  "@csbc-dev/ami-voice": "^0.1.0",
   "@csbc-dev/ai-agent": "^0.2.0",
   "@wc-bindable/core": "^0.8.0",
-  "@wc-bindable/remote": "^0.8.0"
+  "@wc-bindable/remote": "^0.8.0",
+  "@wc-bindable/vue": "^0.8.0",   // ← フロントのバインドアダプタ（React版なら @wc-bindable/react）
+  "vue": "^3.5.0"
 }
 ```
 
@@ -195,7 +206,7 @@ const { AiCore } = await import("@csbc-dev/ai-agent");
 
 ```bash
 git clone https://github.com/csbc-dev/ami-voice
-cd ami-voice/examples/voice-llm
+cd ami-voice/examples/voice-llm-vue
 npm install
 npm run server     # 別ターミナルで npm run dev
 ```
@@ -234,10 +245,9 @@ CSBCで非同期配線を全部追い出すと、最後に**1つの判断**だ�
 - AmiVoiceの音声認識と生成AIの連携は、CSBCの兄弟パッケージを使うと**バインディングの配線だけ**で組めます。
 - 2つのCoreをサーバに置くことで、**APPKEYもLLMのAPIキーもブラウザに出ません**。
 - 実地のコツは「兄弟パッケージで **`@wc-bindable` のメジャー世代を揃える**（`ai-agent@0.2.0` で `0.8` に統一）」と「`AiCore` 取り込みのための `HTMLElement` shim」。
-- フレームワークはVanilla / React / Vue いずれでも、`bind()` か各アダプタに置き換わるだけで本質は同じです。
+- フレームワークはVanilla / Vue / React いずれでも本質は同じ（`bind()` か各アダプタに置き換わるだけ）。リポジトリには3版とも同梱しています（[`voice-llm/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm) / [`voice-llm-vue/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-vue) / [`voice-llm-react/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-react)）。この記事のスニペットは **Vue版**です。
 
-ソース一式：[`examples/voice-llm/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm)
-```
+ソース一式：[`examples/voice-llm-vue/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-vue)
 
 ---
 

@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Wire <ami-voice> (speech) into <ai-agent> (LLM) with binding only — voice → transcript → LLM summary. Both Cores run server-side; no secret reaches the browser.",
   "scripts": {
-    "server": "node server.mjs",
+    "server": "node --env-file-if-exists=.env server.mjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"

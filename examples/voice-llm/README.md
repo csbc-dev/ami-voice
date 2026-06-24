@@ -26,7 +26,7 @@
 | [`fakes.mjs`](fakes.mjs) | 鍵なしで動かすためのフェイク（AmiVoice 上流 + OpenAI 互換 SSE）。 |
 | [`src/main.ts`](src/main.ts) | ★ 配線本体。`transcript → prompt → send()` の一行ポリシー。 |
 
-> 補足: 同階層の [`zenn-draft.md`](zenn-draft.md) はこのサンプルを題材にした **記事の下書き**（`published: false`）で、サンプルの動作には関係しません。`package-lock.json` は `npm install` が生成する通常の成果物です。
+> 補足: 同階層の `package-lock.json` は `npm install` が生成する通常の成果物です。このサンプル群を題材にした **記事の下書き**（Zenn, `published: false`）は Vue 版へ移動しました → [`../voice-llm-vue/zenn-draft.md`](../voice-llm-vue/zenn-draft.md)。
 
 ## 動かす
 

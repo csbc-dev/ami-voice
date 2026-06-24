@@ -119,10 +119,24 @@ examples/
 > Note: `examples/relayServer.mjs` (the package's `npm run example`) is the **minimal** relay-only
 > demo. `examples/shared/server.mjs` here is the fuller server these five clients share.
 
-## Bonus: wire speech into an LLM — [`voice-llm/`](voice-llm/)
+## Bonus: wire speech into an LLM — [`voice-llm/`](voice-llm/) · [`voice-llm-vue/`](voice-llm-vue/) · [`voice-llm-react/`](voice-llm-react/)
 
 [`voice-llm/`](voice-llm/) is a standalone demo that pairs `<ami-voice>` with the sibling
 package `@csbc-dev/ai-agent` (`<ai-agent>`): mic → transcript → LLM summary, with **binding
 only**. Both Cores run server-side (one process holds both the AmiVoice APPKEY and the LLM key);
 the browser sees only state. It has its own combined server and runs fully offline with no
 credentials. See [`voice-llm/README.md`](voice-llm/README.md).
+
+Three front-end flavours of the same composition share one combined server design:
+
+| Variant | Binding | Front-end |
+|---|---|---|
+| [`voice-llm/`](voice-llm/) | `@wc-bindable/core` (`bind`) | Vanilla TS — the projection is hand-written |
+| [`voice-llm-vue/`](voice-llm-vue/) | `@wc-bindable/vue` (`useWcBindable`) | Vue 3 — state binds straight into the template; the only app code left is one `watch` |
+| [`voice-llm-react/`](voice-llm-react/) | `@wc-bindable/react` (`useWcBindable`) | React 19 — state flows into JSX; the only app code left is one `useEffect` |
+
+The Vue/React variants show the payoff of "tag-ifying": with a framework adapter the state→DOM
+projection (the two `bind()` switches, `createElement`, the DOM refs) disappears, leaving just the
+one policy decision — *when* to forward the transcript to the LLM. See
+[`voice-llm-vue/README.md`](voice-llm-vue/README.md) /
+[`voice-llm-react/README.md`](voice-llm-react/README.md).

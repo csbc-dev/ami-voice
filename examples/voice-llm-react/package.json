@@ -1,0 +1,29 @@
+{
+  "name": "ami-voice-example-voice-llm-react",
+  "private": true,
+  "type": "module",
+  "description": "React variant of voice-llm — wire <ami-voice> (speech) into <ai-agent> (LLM) with declarative @wc-bindable/react binding. Both Cores run server-side; no secret reaches the browser.",
+  "scripts": {
+    "server": "node --env-file-if-exists=.env server.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@csbc-dev/ami-voice": "^0.1.0",
+    "@csbc-dev/ai-agent": "^0.2.0",
+    "@wc-bindable/core": "^0.8.0",
+    "@wc-bindable/react": "^0.8.0",
+    "@wc-bindable/remote": "^0.8.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "^5.9.0",
+    "vite": "^6.3.0"
+  }
+}

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
@@ -11,14 +11,7 @@ import { DirectBrowserProvider } from "../../src/components/realtimeSocket";
 import type { DirectSessionInfo } from "../../src/types";
 import { startFakeAmiVoice, type FakeAmiVoiceHandle } from "../support/fakeAmiVoice";
 import { wsSocketFactory } from "../support/wsSocketFactory";
-
-async function waitFor(pred: () => boolean, timeoutMs = 10000, stepMs = 20): Promise<void> {
-  const start = Date.now();
-  while (!pred()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
-    await new Promise((r) => setTimeout(r, stepMs));
-  }
-}
+import { createShell, stubMic, waitFor, type NodeShell } from "../support/nodeShell";
 
 /** Fake `issue_service_authorization` — hands back a canned one-time token. */
 function fakeIssueFetch(token: string): typeof fetch {
@@ -71,6 +64,7 @@ async function startDirectServer(amivoiceUrl: string): Promise<DirectServer> {
 let fake: FakeAmiVoiceHandle | undefined;
 let server: DirectServer | undefined;
 let unbind: (() => void) | undefined;
+let shell: NodeShell | undefined;
 
 afterEach(async () => {
   unbind?.();
@@ -116,5 +110,49 @@ describe("browser-direct end-to-end (ADR 0006)", () => {
     expect(fake.connectionCount()).toBe(1);
 
     controlWs.close();
+  });
+});
+
+/**
+ * SPEC §10.2 in direct mode: the `<ami-voice transport="direct">` Shell's
+ * in-page Core opens the AmiVoice WSS itself (Node's native WebSocket here), so
+ * the previous upstream socket's late `close` and a still-draining graceful stop
+ * hit the in-page Core exactly as they hit the server Core in relay mode.
+ */
+describe("<ami-voice transport=\"direct\"> Shell over real sockets: start() right behind stop() / abort() / reset()", () => {
+  afterEach(() => {
+    shell?.disconnectedCallback();
+    shell = undefined;
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["stop", "abort", "reset"] as const)("%s() then an immediate start() mints and records into a new session", async (cancel) => {
+    fake = await startFakeAmiVoice();
+    server = await startDirectServer(fake.url);
+    shell = await createShell();
+    const el = shell;
+    el.setAttribute("transport", "direct");
+    el.setAttribute("remote-url", server.controlUrl);
+    const mics = stubMic(el);
+    el.connectedCallback();
+    await el.start();
+    await waitFor(() => fake!.connections()[0]?.audioFrames > 0);
+
+    void el[cancel]();
+    await el.start();
+
+    // The re-armed mic feeds the SECOND upstream session; the first one closed
+    // and its late close event did not end the new one.
+    await waitFor(() => (fake!.connections()[1]?.audioFrames ?? 0) > 0);
+    await waitFor(() => fake!.connections()[0].open === false);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(mics()).toBe(2);
+    expect(el.error).toBeNull();
+    expect(el.recognizing).toBe(true);
+    expect(fake.connections().map((c) => c.open)).toEqual([false, true]);
+
+    await el.stop();
+    await waitFor(() => fake!.connections()[1].open === false);
+    expect(el.transcript).toBe(cancel === "stop" ? "こんにちはこんにちは" : "こんにちは");
   });
 });

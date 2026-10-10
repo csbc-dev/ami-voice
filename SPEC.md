@@ -138,6 +138,8 @@ The Core MUST re-normalize every finalized segment it accepts — including one 
 
 The Core MUST publish failures to `error` rather than rejecting `start()` (consumers bind state, not wrap calls in try/catch). On disconnect of either channel the Core MUST tear down the AmiVoice session and the paired channel.
 
+A session the Core has left — stopped, aborted, reset, or closed — MUST NOT affect any later session: whatever it still delivers (a late result or error, and in particular its socket's close, which a platform WebSocket reports only after `abort()` / the graceful stop's `close()` returned) MUST be ignored, and a graceful `stop()` that settles after its session was aborted MUST NOT tear down or publish an error against a session started meanwhile. (Otherwise `abort(); start()` over real sockets loses the new handshake, or drops the new live session while its upstream socket stays open.)
+
 ### 10.1 Upstream drop / reconnection (v1)
 
 AmiVoice's realtime endpoint has **no resume**: if the upstream WSS drops mid-stream, the in-flight utterance is lost. The v1 recovery policy is **explicit restart** (implementation-notes Q3):
@@ -148,17 +150,21 @@ AmiVoice's realtime endpoint has **no resume**: if the upstream WSS drops mid-st
 
 Auto-reconnect (re-opening the upstream and re-sending `s` while keeping the browser session) is a deferred enhancement; if added it MUST still never silently drop finalized `transcript`.
 
-### 10.2 Start ordering on the control channel (Shell)
+### 10.2 Start ordering (Shell)
 
-`start()` MAY be called as soon as the element is connected — before the control channel has opened or delivered its initial `sync` (the README quick start does this), and immediately after `abort()` / `reset()` of a previous session. The control channel is ordered and the Core emits `recognizing=true` before `start()` returns the session id (step 2 above), so the client-side state at `invoke("start")`'s reply reflects the server **after** that start, while state received before the reply may **predate** it: the initial `sync` snapshot (`recognizing=false`), or the previous session's `recognizing=false`. In relay mode the Shell therefore:
+`start()` MAY be called as soon as the element is connected — before the control channel has opened or delivered its initial `sync` (the README quick start does this) — and immediately after `stop()` / `abort()` / `reset()` of a previous session, without awaiting it (a "start over" button, toggling during a recording). Such a `start()` begins a **new** session.
 
-- MUST NOT treat a `recognizing=false` received while its `invoke("start")` is pending as the end of that start's session (no part of the data plane runs before the reply);
+**The Shell waits for its own calls.** The Core refuses a `start` while it is `recognizing` or `loading` (§17) and does not queue one: a graceful `stop()` keeps it `recognizing` until the trailing final result / `e` ack (§18), and a start cancelled during its handshake keeps it `loading` until that handshake settles. In every mode the Shell therefore MUST NOT send `start` (`invoke("start")`, or the in-page Core's `start()`) while a `stop` or `start` it sent earlier is still unanswered; it waits for those to settle first (`abort` / `reset` take effect synchronously in the Core and are not waited for). A `stop()` / `abort()` / `reset()` / DOM disconnection during that wait cancels the start: nothing is sent and no mic is armed. The Shell's "already active" notice (§17) is thus reserved for a Core that is still busy after the wait — a session this element did not end. Sequencing its own commands is the Shell's job (like `setWithAck` before a dependent `start()`, §7.2); whether a session may start stays the Core's decision.
+
+**Stale state.** The control channel is ordered and the Core emits `recognizing=true` before `start()` returns the session id (step 2 above), so the client-side state at `invoke("start")`'s reply reflects the server **after** that start, while state received before the reply may **predate** it: the initial `sync` snapshot (`recognizing=false`), or the previous session's `recognizing=false`. In relay mode the Shell therefore:
+
+- MUST NOT treat a `recognizing=false` received while its start waits or its `invoke("start")` is pending as the end of that start's session (no part of the data plane runs before the reply);
 - at the reply, MUST arm the data plane (audio channel + mic) only when the session id is non-empty, the bound `recognizing` is `true`, and the start was not cancelled meanwhile; a session id it will not use MUST be released with `abort`;
 - when the start is cancelled while pending (`stop()` / `abort()` / `reset()` / DOM disconnection), MUST NOT arm the mic and MUST NOT send an extra `abort` (it could hit a newer start's session): the cancelling command, sent after `start` on the ordered channel — or the control channel's close, which the server answers by disposing the Core (§10) — tears the session down. The cancelled start's own rejection (e.g. the proxy's disposal) is not surfaced as `error`.
 
-In local / direct mode the in-page Core's events are never stale, and the Shell arms the mic only if the Core is `recognizing` once its `start()` resolves (a failed start publishes `error` and leaves `recognizing=false` — §17).
+In local / direct mode the in-page Core's state is never stale once its `start()` resolves (the previous session's `recognizing=false` can still arrive while the new start waits — it does not end the new start), and the Shell arms the mic only if the Core is `recognizing` at that point (a failed start publishes `error` and leaves `recognizing=false` — §17).
 
-Invariant: no start path leaves a server session running with no data plane attached, or a microphone armed with no session.
+Invariant: no start path leaves a server session running with no data plane attached, or a microphone armed with no session; and a `start()` issued right behind `stop()` / `abort()` / `reset()` is neither refused nor lost.
 
 ## 11. Transport contract
 
@@ -238,11 +244,12 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 - Project `level` and `mode`.
 - Forward inputs/commands to the active bind target, including inputs set before connect (§7.2); never hold recognition authority, the APPKEY, or transport choice.
 - Arm the data plane only for a session that is live at `start()`'s reply, never on control-channel state that predates it (§10.2).
+- Send `start` only once its own earlier `stop` / `start` calls have settled, so a `start()` right behind `stop()` / `abort()` / `reset()` opens a new session instead of being refused (§10.2).
 - On `disconnectedCallback`: stop capture, release `MediaStream` tracks, close both channels, dispose the proxy, abort the Core.
 
 ## 17. Error contract
 
-- Recognition / provider failures (start, session I/O, file recognition) **publish to `error` and clear `loading`** — they MUST NOT reject the command Promise. Consumers bind `error`. In relay mode a failed `start()` resolves `null` only after the `error` (and `recognizing` / `loading` = `false`) updates were emitted; the Shell MUST keep that server-published cause rather than replace it with its own "already active" notice (which is reserved for a server that is still `recognizing` / `loading`).
+- Recognition / provider failures (start, session I/O, file recognition) **publish to `error` and clear `loading`** — they MUST NOT reject the command Promise. Consumers bind `error`. In relay mode a failed `start()` resolves `null` only after the `error` (and `recognizing` / `loading` = `false`) updates were emitted; the Shell MUST keep that server-published cause rather than replace it with its own "already active" notice (which is reserved for a server that is still `recognizing` / `loading` after the Shell waited for its own pending `stop` / `start` — §10.2).
 - AmiVoice rejections carry a single-character result `code` (`-` auth, `+` unsupported format, `%` audio too large, `$` client-audio timeout, `o` below-threshold, `b` server busy, `x` grammar not loaded, `c` cancelled, `?` fatal server error, `!`/`>`/`<`/`#` recognizer connect/send/receive/parse (upstream) failures, `^` invalid parameter). The Core SHOULD normalize these into a closed `AmiVoiceErrorCode` union while preserving the raw `message`; the client-error subset (`>`, `o`, `+`, `-`, `%`) is non-retryable.
 - **Wire shape.** The Core's `error` (its getter AND the `ami-voice:error` detail it emits) MUST be a plain JSON-safe `SerializedError` — `{ name, message, code?, resultCode?, retryable? }`, absent keys omitted (never `undefined`), no `stack`, `message` redacted (§14) — in every mode. `@wc-bindable/remote` ≥ 0.10 validates property values as strict `JsonValue`s and drops anything else (an `Error` instance is dropped from `update` and reported as a `sync` `getterFailures` entry), so an `Error` here would never reach the browser. Because the shape is identical locally and over the wire, `getErrorCode(error)` returns the normalized `code` in every mode.
 - **Direct-mode mint failures** reject `invoke("start")` (§11.4) and therefore cross as a `@wc-bindable/remote` `throw` envelope. The Core MUST reject with an `Error` instance (a non-`Error` throw is canonicalized to `NonErrorThrow` with an unusable `message`); the envelope carries `name`, `message`, `code` and the redacted `stack` (`resultCode` / `retryable` do not cross). The browser's in-page Core then publishes it in the wire shape above.
@@ -251,7 +258,8 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 ## 18. Cancellation contract
 
 - `stop()` is graceful: stop capture, send `e`, then **keep consuming `A` / `U` events until the `e` ack arrives** (the `e` response is AmiVoice's end-of-results signal), then settle. The wait MUST be bounded by a fallback timeout (~5 s, configurable) in case the ack is lost; on timeout, settle and keep accumulated state — never error (see [implementation-notes.md Q4](docs/implementation-notes.md)).
-- `abort()` is immediate: drop the AmiVoice session, the audio channel, and the mic with no trailing result.
+- `abort()` is immediate: drop the AmiVoice session, the audio channel, and the mic with no trailing result. Results, errors, or a close the dropped session delivers afterwards are ignored (§10).
+- Until a graceful `stop()` settles the Core is still `recognizing` and refuses a new `start` (§17); the Shell holds a `start()` issued meanwhile until the stop settles (§10.2).
 - DOM disconnection triggers teardown equivalent to `abort()`.
 - Client-side `AckOptions` cancellation does not propagate upstream; only `stop` / `abort` do.
 
@@ -301,6 +309,7 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 | Coverage gate | Implemented — `npm run test:coverage` over the portable logic layer |
 | `@wc-bindable/remote` 0.10 `JsonValue` gate (§7.2, §8, §17) | Implemented + tested — JSON-safe Core `error`, re-normalized `segments`, `null` input reset, Error-only direct-mint rejection; unit suites through the real 0.10 proxies (`__tests__/remoteWire*.test.ts`) + Node integration failure paths (rejected `s`, upstream drop) |
 | Start ordering vs stale control-channel state (§10.2) | Implemented + tested — `start()` before the initial `sync`, `abort()`/`reset()` + immediate `start()`, cancel/disconnect while pending, failed in-page start; unit (real 0.10 proxy), Node integration (the Shell over real sockets), Playwright (`?presync`) |
+| `start()` right behind `stop()` / `abort()` / `reset()` (§10, §10.2) | Implemented + tested — the Shell holds `start` until its own pending `stop` / `start` settle (cancelled by a stop/abort/reset/disconnect meanwhile); the Core ignores callbacks (incl. the late socket close) of a session it already left. Relay / local / direct: unit (real 0.10 proxy + the real session loop over an async-close upstream), Node integration (the Shell over real sockets), Playwright (`restart.browser.spec.ts`) |
 | Inputs set before connect (§7.2) | Implemented + tested — replayed to the server Core (relay/direct) and applied to the in-page Core (local/direct) on connect |
 
 Both transports are implemented and verified end to end in Node and a real browser, and the Phase 3 hardening is in place. **Relay**: browser mic data plane → control proxy → Core → provider WSS loop; binary audio over a `Sec-WebSocket-Protocol`-correlated channel → server helper → `feedAudio`. **Direct** (docs/adr/0006): the control proxy mints (one-time APPKEY + approved `s`); the browser opens the AmiVoice WSS itself and streams audio direct, reusing the shared `runRealtimeSession` loop — the permanent APPKEY never leaves the server and the bindable surface is byte-identical. What remains is a real-AmiVoice smoke run (gated behind `AMIVOICE_APPKEY`) and the user-driven release (version bump + `npm publish`). Resolved/remaining tuning decisions are tracked in [docs/implementation-notes.md](docs/implementation-notes.md).

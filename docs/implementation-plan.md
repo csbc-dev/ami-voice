@@ -4,7 +4,7 @@ Sequenced delivery plan for `@csbc-dev/ami-voice`. Roles of the docs: [ADRs](.) 
 
 ## Current status — Phases 1 & 2 complete; Phase 3 hardening done
 
-Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 212 unit + 6 Node integration + 3 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
+Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 235 unit + 17 Node integration + 9 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
 
 - Bindable surface, Core state machine, target injection, `s`/`p`/`e` builder + `S/E/C/U/A/G` parser, PCM/`LSB16K` encoder, Shell (local/relay/direct, two-channel wiring), mic capture (browser-runtime).
 - Provider realtime WSS loop (injectable socket; shared `runRealtimeSession`), `recognizeFile` (async v2), one-time-APPKEY mint + `prepareDirectSession`, error-code normalization.

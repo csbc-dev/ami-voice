@@ -61,12 +61,21 @@ function resolveStatic(urlPath) {
 }
 
 // ── fake AmiVoice (acks s/e; canned interim/final) ───────────────────────────
+// Every upstream connection, in arrival order, for `GET /__fake/upstream`: a
+// spec can tell WHICH session the mic feeds and whether a closed session's
+// socket really closed (an orphaned one would stay `open`).
+const upstreamConnections = [];
+
 function startFakeAmiVoice() {
   const wss = new WebSocketServer({ port: 0 });
   wss.on("connection", (sock) => {
+    const conn = { open: true, audioFrames: 0 };
+    upstreamConnections.push(conn);
+    sock.on("close", () => { conn.open = false; });
     let sawAudio = false;
     sock.on("message", (data, isBinary) => {
       if (isBinary) {
+        conn.audioFrames++;
         if (!sawAudio) {
           sawAudio = true;
           sock.send('U {"text":"こん","results":[{"tokens":[]}]}');
@@ -134,6 +143,10 @@ async function main() {
 
   const httpServer = createServer(async (req, res) => {
     const urlPath = (req.url ?? "/").split("?")[0];
+    if (urlPath === "/__fake/upstream") {
+      res.writeHead(200, { "content-type": MIME[".json"] }).end(JSON.stringify(upstreamConnections));
+      return;
+    }
     const file = resolveStatic(urlPath);
     if (!file) {
       res.writeHead(404).end("not found");

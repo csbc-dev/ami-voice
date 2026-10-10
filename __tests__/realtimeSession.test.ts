@@ -586,6 +586,48 @@ describe("runRealtimeSession — a graceful stop whose socket.close() throws", (
 });
 
 /**
+ * `abort()` is the consumer's immediate teardown: the Core's `abort()` /
+ * `reset()`, the element's `disconnectedCallback`, the server helper's
+ * `dispose()` (from the control socket's `close` listener). A `close()` that
+ * threw there left `abort()` — and the Core skipped its teardown — so it is
+ * quiet like every other close of the loop (SPEC §18).
+ */
+describe("runRealtimeSession — an abort() whose socket.close() throws", () => {
+  captureUnhandled();
+
+  it("returns, closes once, reports nothing; later frames are dropped and stop() settles at once", async () => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+    const audio = throwOnAudio(fake, new Error("send on a closed socket"));
+
+    expect(() => session.abort()).not.toThrow();
+    session.feedAudio(new Uint8Array([1]));
+    await expect(within(session.stop(), 1000)).resolves.toBeUndefined();
+    expect(() => session.abort()).not.toThrow();
+
+    expect(fake.closeCalls).toBe(1); // a second abort() closes nothing more
+    expect(audio.attempts()).toBe(0);
+    expect(fake.sent).not.toContain("e");
+    expect(h.calls.error).toBeUndefined();
+    expect(unhandled).toEqual([]);
+  });
+
+  it("during a graceful stop: the stop still settles (on its fallback timer), and nothing escapes", async () => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 5);
+    const stopped = session.stop();
+
+    expect(() => session.abort()).not.toThrow();
+
+    await expect(within(stopped, 1000)).resolves.toBeUndefined();
+    expect(h.calls.error).toBeUndefined();
+    expect(unhandled).toEqual([]);
+  });
+});
+
+/**
  * `onopen` sends the `s` command, which carries the APPKEY. A socket can report
  * `open` after the handshake already settled — a connect deadline that fired
  * while it was still connecting, an error, a close — when its `close()` did not

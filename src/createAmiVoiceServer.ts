@@ -3,6 +3,7 @@ import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
 import type { IAmiVoiceProvider, AmiVoiceTransport, SerializedError } from "./types.js";
 import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
 import { redactSecrets, registerKnownSecret } from "./redact.js";
+import { toSerializedError } from "./normaliseError.js";
 import { readProcessEnv } from "./processEnv.js";
 import {
   RemoteShellProxy, type ServerTransport, type ServerMessage, type RemoteSerializedError,
@@ -47,6 +48,13 @@ import {
  * published `code` + `message`; the exception itself (class, `stack`, `cause`)
  * is `AmiVoiceCore.originalError`, read from an `ami-voice:error` listener on
  * `AmiVoiceControlSession.core` (SPEC §14).
+ *
+ * It is also logged for a throw the helper catches in its own socket callbacks
+ * rather than let it reach the server process (SPEC §17, §18): a custom
+ * provider's session whose `abort()` throws when `dispose()` runs, and anything
+ * escaping `core.feedAudio` in the audio listener (once per audio connection;
+ * by design nothing does). That record carries the redacted `message`, the
+ * `code` and, for an `Error`, the redacted `stack`.
  */
 export type AmiVoiceServerLogEvent =
   | { type: "control-open"; transport: AmiVoiceTransport; peerAddress?: string }
@@ -69,8 +77,9 @@ export interface AmiVoiceRelayServerOptions {
   epiWithoutIpa?: number;
   /**
    * Structured logger (Phase 3.5). Receives connection open/close, rejected audio
-   * frames, emitted Core errors, and the errors sent to the browser as a remote
-   * `throw` (with the server stack the browser no longer gets). Default: no-op.
+   * frames, emitted Core errors, the errors sent to the browser as a remote
+   * `throw` (with the server stack the browser no longer gets), and the throws
+   * the helper catches in its own socket callbacks. Default: no-op.
    * Sensitive values (APPKEY, audio token, wire payloads) are never passed to it.
    */
   logger?: AmiVoiceServerLogger;
@@ -85,7 +94,11 @@ export interface AmiVoiceControlConnectionOptions {
 export interface AmiVoiceControlSession {
   core: AmiVoiceCore;
   shell: RemoteShellProxy;
-  /** Tear down: drop the session token, dispose the shell, abort the Core. */
+  /**
+   * Tear down: drop the session token, dispose the shell, abort the Core.
+   * Safe to call from the control socket's `close` listener: a session whose
+   * `abort()` throws (a custom provider's) is logged, not thrown.
+   */
   dispose(): void;
 }
 
@@ -198,6 +211,22 @@ export function createAmiVoiceRelayServer(
   registerKnownSecret(readProcessEnv("AMIVOICE_APPKEY"));
   registerKnownSecret(readProcessEnv("AMIVOICE_SERVICE_PASSWORD"));
 
+  // A value thrown inside the helper's own socket callbacks, where it must not
+  // escape (the server process's uncaught exception), logged redacted instead:
+  // its `message` and `code` as the Core would publish them
+  // (`toSerializedError`, which also copes with a hostile value) and, for an
+  // `Error`, its `stack`. A throwing logger does not escape either.
+  const logThrown = (thrown: unknown): void => {
+    try {
+      const shaped = toSerializedError(thrown) ?? { name: "Error", message: String(thrown) };
+      const record: Extract<AmiVoiceServerLogEvent, { type: "error" }> = { type: "error", message: shaped.message };
+      const code = getErrorCode(shaped);
+      if (code) record.code = code;
+      if (thrown instanceof Error && typeof thrown.stack === "string") record.stack = redactSecrets(thrown.stack);
+      log(record);
+    } catch { /* nothing more to do */ }
+  };
+
   return {
     handleControlConnection(
       transport: ServerTransport,
@@ -268,7 +297,16 @@ export function createAmiVoiceRelayServer(
           core.removeEventListener("ami-voice:error", onCoreError);
           core.removeEventListener("ami-voice:recognizing-changed", onRecognizingChanged);
           shell.dispose();
-          core.abort();
+          // `dispose()` runs from the control socket's `close` listener (the
+          // server's `ws` dispatch), where a throw is the server process's
+          // uncaught exception. The Core has torn down already when its
+          // `abort()` throws — a custom provider's session whose `abort()`
+          // throws (the shared loop's never does) — so the throw is only logged.
+          try {
+            core.abort();
+          } catch (err) {
+            logThrown(err);
+          }
           log({ type: "control-close", transport: transportMode, peerAddress: connOptions.peerAddress });
         },
       };
@@ -281,9 +319,22 @@ export function createAmiVoiceRelayServer(
         socket.close();
         return false;
       }
+      // Last line of defence: this listener runs from the audio socket's
+      // dispatch (`ws`), where a throw is the server process's uncaught
+      // exception (Node exits). `core.feedAudio` never throws — a session's
+      // failure is the Core's to publish, once (SPEC §17) — so anything caught
+      // here is unexpected, and is NOT published (no second `error`): it is
+      // logged once per audio connection, redacted, and the frame is dropped.
+      let reported = false;
       const onData = (data: unknown): void => {
-        const bytes = toUint8(data);
-        if (bytes) core.feedAudio(bytes);
+        try {
+          const bytes = toUint8(data);
+          if (bytes) core.feedAudio(bytes);
+        } catch (err) {
+          if (reported) return;
+          reported = true;
+          logThrown(err);
+        }
       };
       if (typeof socket.on === "function") socket.on("message", onData);
       else socket.onmessage = (event) => onData(event.data);

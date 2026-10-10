@@ -128,7 +128,7 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each as 
 
 ### Structured logging
 
-`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and errors: those the Core publishes, and those sent to the browser as a failed call (e.g. a direct-mode mint failure). Records never contain the APPKEY, the audio token, or wire payloads.
+`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and errors: those the Core publishes, those sent to the browser as a failed call (e.g. a direct-mode mint failure), and those the helper catches in its own socket callbacks instead of letting them crash the process (e.g. a custom provider's session whose `abort()` throws when `dispose()` runs). Records never contain the APPKEY, the audio token, or wire payloads.
 
 Server internals stay on the server: the browser gets a failed call's `name` / `message` / `code` without the `stack` or the `cause` chain, and the `error` record carries both (redacted) instead.
 

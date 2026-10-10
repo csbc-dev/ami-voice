@@ -17,6 +17,10 @@
   <h1>ami-voice direct e2e</h1>
   <button id="start">start</button>
   <button id="stop">stop</button>
+  <!-- "Start over": cancel and start again in one click, without awaiting (SPEC §10.2). -->
+  <button id="restart-stop">stop + start</button>
+  <button id="restart-abort">abort + start</button>
+  <button id="restart-reset">reset + start</button>
   <output id="interim"></output>
   <output id="transcript"></output>
   <output id="error"></output>
@@ -52,6 +56,9 @@
 
     out("start").addEventListener("click", () => { void av.start(); });
     out("stop").addEventListener("click", () => { void av.stop(); });
+    for (const cancel of ["stop", "abort", "reset"]) {
+      out(`restart-${cancel}`).addEventListener("click", () => { void av[cancel](); void av.start(); });
+    }
 
     window.__av = av;
   </script>

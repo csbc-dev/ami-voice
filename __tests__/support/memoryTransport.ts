@@ -91,3 +91,109 @@ export function scriptedUpstream(opts: { rejectStart?: boolean } = {}): {
     drop: () => { sock?.onclose?.(); },
   };
 }
+
+/** One upstream connection of {@link fakeUpstream}. */
+export interface FakeUpstreamConn {
+  readonly url: string;
+  /** False once either side closed it. A Core that lost track of an open one orphaned it. */
+  open: boolean;
+  /** Audio payloads received (the `p` command byte stripped). */
+  readonly fed: number[][];
+}
+
+/**
+ * A fake AmiVoice realtime upstream for the REAL `runRealtimeSession` loop that
+ * behaves like a platform WebSocket where the session lifecycle cares:
+ *  - `close()` fires `onclose` LATER (a macrotask — the close handshake), so a
+ *    session the Core already left can report its close after the next session
+ *    started;
+ *  - `e` is answered with the trailing final `A` + the `e` ack — at once, or held
+ *    until `releaseStops()` to model a graceful stop that is still draining.
+ * Usable through the provider seam (`socketFactory`) and as the global
+ * `WebSocket` (`WebSocketClass`, for the browser-direct `wrapWebSocket`).
+ */
+export function fakeUpstream(opts: { holdStop?: boolean } = {}): {
+  socketFactory: (url: string) => RealtimeSocket;
+  WebSocketClass: new (url: string) => unknown;
+  conns: FakeUpstreamConn[];
+  opened(): number;
+  live(): number;
+  releaseStops(): void;
+} {
+  const conns: FakeUpstreamConn[] = [];
+  const heldStops: Array<() => void> = [];
+  const finalText = "こんにちは";
+  const finalFrame = `A ${JSON.stringify({ text: finalText, results: [{ text: finalText, confidence: 0.9, starttime: 0, endtime: 1, tokens: [] }] })}`;
+
+  interface Peer { open(): void; message(text: string): void; closed(): void }
+  function connect(url: string, peer: Peer): { send(d: unknown): void; close(): void } {
+    const conn: FakeUpstreamConn = { url, open: true, fed: [] };
+    conns.push(conn);
+    const deliver = (text: string): void => { if (conn.open) peer.message(text); };
+    const shutdown = (): void => {
+      if (!conn.open) return;
+      conn.open = false;
+      setTimeout(() => peer.closed(), 0); // the close handshake completes later
+    };
+    queueMicrotask(() => { if (conn.open) peer.open(); });
+    return {
+      send: (d) => {
+        if (!conn.open) return;
+        if (typeof d !== "string") {
+          const bytes = d instanceof Uint8Array ? d : new Uint8Array(d as ArrayBuffer);
+          conn.fed.push([...bytes.subarray(1)]); // strip the `p` command byte
+          return;
+        }
+        if (d.startsWith("s ")) queueMicrotask(() => deliver("s"));
+        else if (d === "e") {
+          const answer = (): void => { deliver(finalFrame); deliver("e"); };
+          if (opts.holdStop) heldStops.push(answer);
+          else queueMicrotask(answer);
+        }
+      },
+      close: shutdown,
+    };
+  }
+
+  class FakeAmiVoiceWebSocket {
+    static readonly OPEN = 1;
+    readyState = 0;
+    binaryType = "blob";
+    bufferedAmount = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: ((e: unknown) => void) | null = null;
+    private readonly _link: { send(d: unknown): void; close(): void };
+    constructor(readonly url: string) {
+      this._link = connect(url, {
+        open: () => { this.readyState = 1; this.onopen?.(); },
+        message: (text) => this.onmessage?.({ data: text }),
+        closed: () => { this.readyState = 3; this.onclose?.(); },
+      });
+    }
+    send(d: unknown): void { this._link.send(d); }
+    close(): void { this._link.close(); }
+  }
+
+  return {
+    socketFactory: (url) => {
+      const sock: RealtimeSocket = {
+        send: (d) => link.send(d),
+        close: () => link.close(),
+        onopen: null, onmessage: null, onclose: null, onerror: null,
+      };
+      const link = connect(url, {
+        open: () => sock.onopen?.(),
+        message: (text) => sock.onmessage?.(text),
+        closed: () => sock.onclose?.(),
+      });
+      return sock;
+    },
+    WebSocketClass: FakeAmiVoiceWebSocket,
+    conns,
+    opened: () => conns.length,
+    live: () => conns.filter((c) => c.open).length,
+    releaseStops: () => { for (const answer of heldStops.splice(0)) answer(); },
+  };
+}

@@ -17,9 +17,19 @@ export interface FakeAmiVoiceOptions {
   rejectStart?: string;
 }
 
+/** One upstream connection the fake accepted, in arrival order. */
+export interface FakeAmiVoiceConnection {
+  /** False once the socket closed (from either side). */
+  open: boolean;
+  /** Binary `p` audio frames received. */
+  audioFrames: number;
+}
+
 export interface FakeAmiVoiceHandle {
   url: string;
   connectionCount(): number;
+  /** Every connection so far — a session the Core forgot but never closed stays `open`. */
+  connections(): FakeAmiVoiceConnection[];
   /** Terminate every open upstream socket — an unsolicited mid-session drop (SPEC §10.1). */
   dropAll(): void;
   close(): Promise<void>;
@@ -28,15 +38,18 @@ export interface FakeAmiVoiceHandle {
 export function startFakeAmiVoice(opts: FakeAmiVoiceOptions = {}): Promise<FakeAmiVoiceHandle> {
   const interimText = opts.interimText ?? "こん";
   const finalText = opts.finalText ?? "こんにちは";
-  let connections = 0;
+  const conns: FakeAmiVoiceConnection[] = [];
 
   const wss = new WebSocketServer({ port: 0 });
 
   wss.on("connection", (sock: WsSocket) => {
-    connections++;
+    const conn: FakeAmiVoiceConnection = { open: true, audioFrames: 0 };
+    conns.push(conn);
+    sock.on("close", () => { conn.open = false; });
     let sawAudio = false;
     sock.on("message", (data: Buffer, isBinary: boolean) => {
       if (isBinary) {
+        conn.audioFrames++;
         // 'p' audio frame (first byte 0x70). Emit one interim on the first frame.
         if (!sawAudio) {
           sawAudio = true;
@@ -63,7 +76,8 @@ export function startFakeAmiVoice(opts: FakeAmiVoiceOptions = {}): Promise<FakeA
       const { port } = wss.address() as AddressInfo;
       resolve({
         url: `ws://127.0.0.1:${port}/`,
-        connectionCount: () => connections,
+        connectionCount: () => conns.length,
+        connections: () => conns,
         dropAll: () => { for (const client of wss.clients) client.terminate(); },
         close: () => new Promise<void>((r) => wss.close(() => r())),
       });

@@ -12,14 +12,7 @@ import { AmiVoiceCore } from "../../src/core/AmiVoiceCore";
 import { getErrorCode } from "../../src/errorCodes";
 import { startFakeAmiVoice, type FakeAmiVoiceHandle } from "../support/fakeAmiVoice";
 import { wsSocketFactory } from "../support/wsSocketFactory";
-
-async function waitFor(pred: () => boolean, timeoutMs = 10000, stepMs = 20): Promise<void> {
-  const start = Date.now();
-  while (!pred()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
-    await new Promise((r) => setTimeout(r, stepMs));
-  }
-}
+import { createShell, stubMic, waitFor, type NodeShell } from "../support/nodeShell";
 
 interface RelayServer {
   controlUrl: string;
@@ -75,44 +68,6 @@ async function startRelayServer(amivoiceUrl: string): Promise<RelayServer> {
   };
 }
 
-/**
- * Just enough `HTMLElement` to run the `<ami-voice>` Shell under Node: attributes
- * plus the (native) EventTarget it dispatches `ami-voice:*` on. The test drives
- * the custom-element lifecycle hooks by hand; everything else — the control and
- * audio WebSockets (Node's native `WebSocket`), the 0.10 proxies, the relay
- * helper, the provider loop, the fake AmiVoice — is real. Only the browser mic
- * (`getUserMedia` / `AudioWorklet`) is stubbed; Playwright covers it.
- */
-class ShimHTMLElement extends EventTarget {
-  private readonly _attrs = new Map<string, string>();
-  getAttribute(name: string): string | null { return this._attrs.get(name) ?? null; }
-  setAttribute(name: string, value: string): void {
-    const old = this.getAttribute(name);
-    this._attrs.set(name, value);
-    (this as { attributeChangedCallback?(n: string, o: string | null, v: string): void })
-      .attributeChangedCallback?.(name, old, value);
-  }
-}
-
-type NodeShell = ShimHTMLElement & {
-  start(): Promise<void>;
-  stop(): Promise<void>;
-  connectedCallback(): void;
-  disconnectedCallback(): void;
-  readonly interim: string;
-  readonly transcript: string;
-  readonly error: unknown;
-  _audioWs: WebSocket | null;
-  _startMic(onFrame: (bytes: Uint8Array) => void): Promise<void>;
-};
-
-/** Import the Shell with the shim as its `HTMLElement` base (module eval needs it). */
-async function createShell(): Promise<NodeShell> {
-  vi.stubGlobal("HTMLElement", ShimHTMLElement);
-  const { AmiVoice } = await import("../../src/components/AmiVoice");
-  return new (AmiVoice as unknown as new () => NodeShell)();
-}
-
 let fake: FakeAmiVoiceHandle | undefined;
 let server: RelayServer | undefined;
 let unbind: (() => void) | undefined;
@@ -124,6 +79,8 @@ afterEach(async () => {
   await server?.close();
   await fake?.close();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   unbind = undefined; server = undefined; fake = undefined; shell = undefined;
 });
 
@@ -252,5 +209,94 @@ describe("relay end-to-end (control + binary audio)", () => {
     // The server validates the token and closes immediately.
     await once(audioWs, "close");
     expect(audioWs.readyState).toBe(WebSocket.CLOSED);
+  });
+});
+
+/**
+ * SPEC §10.2: `el.stop(); el.start()` (a "start over" button, toggling during a
+ * recording) and `abort()` / `reset()` + `start()` must record into a NEW
+ * session. Over real sockets two things broke it: the Core refused a start that
+ * arrived while the previous session was still draining its graceful stop
+ * ("already active"), and the previous upstream socket's `close` event — which a
+ * real WebSocket delivers after `abort()` / the stop's `close()` returned — was
+ * applied to the next session (its handshake aborted: "the server opened no
+ * recognition session"). `fake.connections()` shows every upstream socket, so a
+ * session the Core forgot but never closed would stay `open`.
+ */
+describe("<ami-voice> Shell over real sockets: start() right behind stop() / abort() / reset()", () => {
+  /** Wait until the first upstream socket closed and its (late) close event reached the Core. */
+  async function firstUpstreamClosed(f: FakeAmiVoiceHandle): Promise<void> {
+    await waitFor(() => f.connections()[0]?.open === false);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  async function expectNewSession(el: NodeShell, f: FakeAmiVoiceHandle, mics: () => number): Promise<void> {
+    // The mic was re-armed and its frame reached the SECOND upstream session.
+    await waitFor(() => (f.connections()[1]?.audioFrames ?? 0) > 0);
+    await firstUpstreamClosed(f);
+    expect(mics()).toBe(2);
+    expect(el.error).toBeNull();
+    expect(el.recognizing).toBe(true);
+    expect(f.connections().map((c) => c.open)).toEqual([false, true]);
+    await el.stop();
+    await waitFor(() => f.connections()[1].open === false);
+    expect(el.recognizing).toBe(false);
+  }
+
+  async function relayShell(): Promise<{ el: NodeShell; mics: () => number }> {
+    fake = await startFakeAmiVoice();
+    server = await startRelayServer(fake.url);
+    shell = await createShell();
+    const el = shell;
+    el.setAttribute("mode", "remote");
+    el.setAttribute("remote-url", server.controlUrl);
+    const mics = stubMic(el);
+    el.connectedCallback();
+    await el.start();
+    await waitFor(() => fake!.connections()[0]?.audioFrames > 0);
+    return { el, mics };
+  }
+
+  /** Local (dev) mode: the in-page provider talks to the fake over Node's native WebSocket. */
+  async function localShell(): Promise<{ el: NodeShell; mics: () => number }> {
+    fake = await startFakeAmiVoice();
+    vi.stubEnv("AMIVOICE_APPKEY", "TEST");
+    vi.spyOn(AmiVoiceProvider.prototype, "endpointFor").mockReturnValue(fake.url);
+    shell = await createShell();
+    const el = shell;
+    el.setAttribute("mode", "local");
+    const mics = stubMic(el);
+    el.connectedCallback();
+    await el.start();
+    await waitFor(() => fake!.connections()[0]?.audioFrames > 0);
+    return { el, mics };
+  }
+
+  const shells = { relay: relayShell, local: localShell } as const;
+  const cases = (["relay", "local"] as const).flatMap((mode) =>
+    (["stop", "abort", "reset"] as const).map((cancel) => [mode, cancel] as const));
+
+  it.each(cases)("%s: %s() then an immediate start() records into a new session", async (mode, cancel) => {
+    const { el, mics } = await shells[mode]();
+
+    void el[cancel]();
+    await el.start();
+
+    await expectNewSession(el, fake!, mics);
+    // The new session's final result — after, for a graceful stop, the old
+    // session's trailing one (abort drops it; reset also clears the transcript).
+    expect(el.transcript).toBe(cancel === "stop" ? "こんにちはこんにちは" : "こんにちは");
+  });
+
+  it.each(["relay", "local"] as const)("%s: rapid toggling while recording ends in one new session", async (mode) => {
+    const { el, mics } = await shells[mode]();
+
+    void el.stop();
+    void el.start(); // superseded before it is ever sent
+    void el.stop();
+    await el.start();
+
+    await expectNewSession(el, fake!, mics);
+    expect(fake!.connectionCount()).toBe(2);
   });
 });

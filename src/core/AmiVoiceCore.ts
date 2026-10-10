@@ -106,6 +106,8 @@ export class AmiVoiceCore extends EventTarget {
    * teardown intervened during the handshake, the just-opened session is released
    * instead of being resurrected with `recognizing/connected=true`. Mirrors the
    * generation pattern `MicCapture` uses for the same disconnect-during-start race.
+   * The same value also identifies the live session: its callbacks (`_handlers`)
+   * and a pending graceful `stop()` act only while it is unchanged.
    */
   private _sessionGeneration = 0;
 
@@ -231,16 +233,30 @@ export class AmiVoiceCore extends EventTarget {
     };
   }
 
-  private _handlers(): RealtimeSessionHandlers {
+  /**
+   * Callbacks for ONE session, opened while `_sessionGeneration === generation`.
+   * Once that session is torn down (stop / abort / reset / its own close) the
+   * generation moves on and these callbacks go inert: a session the Core has
+   * already left MUST NOT touch the state of the next one (SPEC §10). The
+   * platform WebSocket fires `onclose` asynchronously after `abort()` or a
+   * graceful stop's `close()`, so without this gate that late close ran
+   * `_teardownSession()` against a NEWER session — aborting its handshake
+   * (`abort(); start()` resolved `null`) or, once it was live, nulling `_session`
+   * and flipping `recognizing=false` while its upstream socket stayed open
+   * (orphaned). Results/errors arriving after `abort()` are likewise dropped
+   * (SPEC §18: no trailing result).
+   */
+  private _handlers(generation: number): RealtimeSessionHandlers {
+    const current = (): boolean => generation === this._sessionGeneration;
     return {
       onSegmentStart: () => { /* S — reserved for VAD-driven UI hooks */ },
       onSegmentEnd: () => { /* E — reserved for VAD-driven UI hooks */ },
       onRecognitionStart: () => { /* C */ },
       // A custom provider's interim may lack `text`; keep `interim` a string.
-      onInterim: (r) => { this._setInterim(typeof r?.text === "string" ? r.text : ""); },
-      onFinal: (r) => { this._appendFinal(r); },
-      onError: (e) => { this._setError(e); },
-      onClose: () => { this._teardownSession(); },
+      onInterim: (r) => { if (current()) this._setInterim(typeof r?.text === "string" ? r.text : ""); },
+      onFinal: (r) => { if (current()) this._appendFinal(r); },
+      onError: (e) => { if (current()) this._setError(e); },
+      onClose: () => { if (current()) this._teardownSession(); },
     };
   }
 
@@ -283,6 +299,12 @@ export class AmiVoiceCore extends EventTarget {
    * ordered control channel the browser already holds the real cause (and
    * `recognizing=false`, `loading=false`) when it sees the `null`.
    *
+   * "Already active" includes a session that is still draining a graceful
+   * `stop()` (`recognizing` stays true until it settles) and a cancelled
+   * handshake (`loading` stays true until it settles): the Core does not queue a
+   * start behind them. A caller that issued that stop / cancel waits for it
+   * first — the Shell does (SPEC §10.2).
+   *
    * Direct (docs/adr/0006): the Core opens NO upstream — it mints a one-time
    * APPKEY + approved `s` command and returns them as `DirectSessionInfo` for the
    * browser to open the WSS itself. Mint failures REJECT here (rather than
@@ -309,7 +331,7 @@ export class AmiVoiceCore extends EventTarget {
         }
         return await this._provider.prepareDirectSession(this._currentOptions(), this._mintOptions?.());
       }
-      const session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers());
+      const session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers(generation));
       if (generation !== this._sessionGeneration) {
         // A teardown intervened during the handshake; drop the orphaned session.
         session.abort();
@@ -343,12 +365,17 @@ export class AmiVoiceCore extends EventTarget {
       if (this._loading) this._teardownSession();
       return;
     }
+    // The graceful drain can take until the `e` ack (or the ~5 s fallback, SPEC
+    // §18). If this session is torn down meanwhile — an `abort()` / `reset()`, its
+    // own close — and a newer `start()` begins, this stop's settle must not tear
+    // the NEWER session down nor publish an error against it.
+    const generation = this._sessionGeneration;
     try {
       await session.stop();
     } catch (err) {
-      this._setError(err);
+      if (generation === this._sessionGeneration) this._setError(err);
     } finally {
-      this._teardownSession();
+      if (generation === this._sessionGeneration) this._teardownSession();
     }
   }
 

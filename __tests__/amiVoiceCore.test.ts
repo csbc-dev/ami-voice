@@ -355,6 +355,136 @@ describe("AmiVoiceCore", () => {
 });
 
 /**
+ * A session the Core has left (stopped / aborted / reset) can still call back:
+ * a platform WebSocket fires `onclose` AFTER `abort()` / a graceful stop's
+ * `close()` returned, and a graceful stop may settle after an `abort()`. None of
+ * that may touch the NEXT session (SPEC §10) — it used to abort the next
+ * handshake, or drop the next live session while its upstream stayed open.
+ */
+describe("AmiVoiceCore: callbacks of a session it already left", () => {
+  function multiSessionProvider() {
+    const sessions: Array<{
+      handlers: RealtimeSessionHandlers; session: IRealtimeSession; finishStop: () => void; failStop: (e: unknown) => void;
+    }> = [];
+    let holdOpen: ((resolve: () => void) => void) | null = null;
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: async (_options, handlers) => {
+        let finishStop!: () => void;
+        let failStop!: (e: unknown) => void;
+        const stopped = new Promise<void>((resolve, reject) => { finishStop = resolve; failStop = reject; });
+        const session: IRealtimeSession = { feedAudio: vi.fn(), stop: vi.fn(() => stopped), abort: vi.fn() };
+        sessions.push({ handlers, session, finishStop, failStop });
+        if (holdOpen) await new Promise<void>((r) => holdOpen!(r));
+        return session;
+      },
+      recognizeFile: async () => [],
+    };
+    return { provider, sessions, hold: (h: typeof holdOpen) => { holdOpen = h; } };
+  }
+
+  it("a late onClose of an aborted session leaves the next live session alone", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider, undefined, { mintSessionId: () => "id" });
+    await core.start();
+    core.abort();
+    expect(await core.start()).toBe("id");
+
+    f.sessions[0].handlers.onClose(); // the first socket's close lands now
+
+    expect(core.recognizing).toBe(true);
+    expect(core.connected).toBe(true);
+    core.feedAudio(new Uint8Array([1]));
+    expect(f.sessions[1].session.feedAudio).toHaveBeenCalledTimes(1); // still routed to the live session
+    core.abort();
+    expect(f.sessions[1].session.abort).toHaveBeenCalledTimes(1); // and the Core can still release it
+  });
+
+  it("a late onClose of an aborted session during the next handshake does not abort it", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider, undefined, { mintSessionId: () => "id" });
+    await core.start();
+    core.abort();
+    let open!: () => void;
+    f.hold((r) => { open = r; });
+    const starting = core.start();
+    await Promise.resolve();
+
+    f.sessions[0].handlers.onClose(); // lands mid-handshake
+    open();
+
+    expect(await starting).toBe("id");
+    expect(f.sessions[1].session.abort).not.toHaveBeenCalled();
+    expect(core.recognizing).toBe(true);
+  });
+
+  it("results / errors of an aborted session are dropped (no trailing result — SPEC §18)", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+    core.abort();
+
+    f.sessions[0].handlers.onInterim({ text: "late", tokens: [] });
+    f.sessions[0].handlers.onFinal({ text: "late", confidence: 0.9, starttime: 0, endtime: 1, tokens: [] });
+    f.sessions[0].handlers.onError(new AmiVoiceError("<", "AmiVoice connection lost mid-session"));
+
+    expect(core.interim).toBe("");
+    expect(core.transcript).toBe("");
+    expect(core.segments).toHaveLength(0);
+    expect(core.error).toBeNull();
+  });
+
+  it("a graceful stop that settles after abort() + a new start() leaves the new session alone", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+    const stopping = core.stop(); // draining…
+    core.abort();                 // …cut short
+    await core.start();           // a new session meanwhile
+    expect(core.recognizing).toBe(true);
+
+    f.sessions[0].finishStop();   // the old drain settles late
+    await stopping;
+
+    expect(core.recognizing).toBe(true);
+    expect(core.connected).toBe(true);
+    core.feedAudio(new Uint8Array([1]));
+    expect(f.sessions[1].session.feedAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it("a graceful stop that FAILS after abort() + a new start() publishes nothing against the new session", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+    const stopping = core.stop();
+    core.abort();
+    await core.start();
+
+    f.sessions[0].failStop(new Error("flush failed")); // the old drain fails late
+    await stopping;
+
+    expect(core.error).toBeNull();
+    expect(core.recognizing).toBe(true);
+  });
+
+  it("start() during a graceful stop is refused (the caller waits for its stop — SPEC §10.2)", async () => {
+    const f = multiSessionProvider();
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+    const stopping = core.stop();
+
+    expect(await core.start()).toBeNull(); // still `recognizing` while draining
+    expect(f.sessions).toHaveLength(1);
+
+    f.sessions[0].finishStop();
+    await stopping;
+    expect(core.recognizing).toBe(false);
+    await core.start();
+    expect(core.recognizing).toBe(true);
+    expect(f.sessions).toHaveLength(2);
+  });
+});
+
+/**
  * Inputs: `null` / `undefined` reset to the default (SPEC §7.2; wc-bindable
  * SPEC-extensions Producer guidance P1/P2). Remote clients cannot send
  * `undefined` (not a JsonValue), so `null` is the wire reset — and without it a

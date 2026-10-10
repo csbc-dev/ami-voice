@@ -8,7 +8,10 @@ import { AmiVoiceError, getErrorCode } from "../src/errorCodes";
 import type {
   IAmiVoiceProvider, DirectSessionInfo, RealtimeSessionHandlers, RecognitionOptions,
 } from "../src/types";
-import { memoryTransportPair, captureConsole, scriptedUpstream, type MemoryTransportPair } from "./support/memoryTransport";
+import {
+  memoryTransportPair, captureConsole, scriptedUpstream, fakeUpstream, type MemoryTransportPair,
+} from "./support/memoryTransport";
+import { runRealtimeSession } from "../src/protocol/realtimeSession";
 
 /**
  * Element-level (`<ami-voice>`) regression suite against the REAL
@@ -645,4 +648,292 @@ describe("<ami-voice> inputs set before connect reach the in-page Core (SPEC §7
     expect(ctrl.core.engine).toBe("-a-medical");
     expect(ctrl.core.codec).toBe("LSB16K");
   });
+});
+
+// ── start() right behind stop() / abort() / reset() ───────────────────────────
+
+/**
+ * Bug: `el.stop(); el.start()` (a "start over" button, or toggling during a
+ * recording) never started a new session. The graceful stop keeps the Core
+ * `recognizing` until the trailing final result / `e` ack (SPEC §18), so the
+ * Core refused the start that arrived meanwhile and the Shell reported "start()
+ * ignored: a recognition session is already active" (relay) or armed the mic for
+ * the session being stopped (local / direct). The Shell now waits for its own
+ * in-flight stop — and for a start it cancelled — before sending the start
+ * (SPEC §10.2).
+ *
+ * Bug (same family): a real WebSocket fires `onclose` after `abort()` / a
+ * graceful stop's `close()` returned, and the Core applied that late close of the
+ * PREVIOUS session to the current one — aborting the next handshake or, once the
+ * next session was live, dropping it while its upstream socket stayed open. The
+ * recordingProvider above never fires `onClose`, so these cases run the real
+ * `runRealtimeSession` loop over `fakeUpstream` (asynchronous close, drainable
+ * stop). `upstream.live()` counts upstream sockets nobody closed.
+ */
+describe("<ami-voice>: start() right behind stop() / abort() / reset() starts a new session (SPEC §10.2)", () => {
+  const CANCELS = ["stop", "abort", "reset"] as const;
+
+  function relayWithUpstream(opts?: { holdStop?: boolean }) {
+    const upstream = fakeUpstream(opts);
+    const server = relayServer(() => new AmiVoiceProvider({ appKey: "K", socketFactory: upstream.socketFactory }));
+    routeAudioTo(server.relay);
+    const el = mount(server.pair);
+    const mic = stubMic(el);
+    const errors = errorsOf(el);
+    return { upstream, ...server, el, mic, errors };
+  }
+
+  /** The server Core's private session slot: `null` once it has let go of the session. */
+  function coreSession(core: unknown): unknown {
+    return (core as { _session: unknown })._session;
+  }
+
+  it.each(CANCELS)("relay: %s() then an immediate start() records into a NEW session; nothing is orphaned", async (cancel) => {
+    const con = captureConsole();
+    const { upstream, ctrl, relay, el, mic, errors } = relayWithUpstream();
+    await synced(el);
+    await el.start();
+    expect(upstream.live()).toBe(1);
+
+    const cancelled = el[cancel]();
+    await el.start();
+    await cancelled;
+    await settle(); // let the first upstream's (late) close land
+
+    expect(errors).toEqual([]); // no "already active", no "opened no recognition session"
+    expect(el._startMic).toHaveBeenCalledTimes(2);
+    expect(el._dataPlaneLive).toBe(true);
+    expect(el.recognizing).toBe(true);
+    expect(ctrl.core.recognizing).toBe(true);
+    expect(coreSession(ctrl.core)).not.toBeNull();
+    expect(upstream.opened()).toBe(2);
+    expect(upstream.live()).toBe(1);
+    expect(upstream.conns[1].open).toBe(true); // the live one is the NEW session's
+    expect(relay.sessionCount()).toBe(1);
+    mic.frame([7]);
+    expect(upstream.conns[1].fed).toEqual([[7]]); // the mic feeds the new session
+    // A graceful stop delivered the old session's trailing final result first.
+    expect(el.transcript).toBe(cancel === "stop" ? "こんにちは" : "");
+
+    await el.stop();
+    await settle();
+    expect(upstream.live()).toBe(0);
+    expect(relay.sessionCount()).toBe(0);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("relay: the start is held while the previous session drains its graceful stop", async () => {
+    const { upstream, ctrl, el, errors } = relayWithUpstream({ holdStop: true });
+    await synced(el);
+    await el.start();
+    const serverStart = vi.spyOn(ctrl.core, "start");
+
+    const stopped = el.stop();
+    let startDone = false;
+    const started = el.start().then(() => { startDone = true; });
+    await settle();
+
+    // Still draining (no `e` ack yet): the Core is `recognizing`, so the Shell
+    // has not sent the start — it would be refused as "already active".
+    expect(ctrl.core.recognizing).toBe(true);
+    expect(serverStart).not.toHaveBeenCalled();
+    expect(startDone).toBe(false);
+    expect(errors).toEqual([]);
+
+    upstream.releaseStops(); // trailing `A` + `e` ack
+    await stopped;
+    await started;
+    await settle();
+
+    expect(serverStart).toHaveBeenCalledTimes(1);
+    expect(el.transcript).toBe("こんにちは"); // the old session's final result was kept
+    expect(ctrl.core.recognizing).toBe(true);
+    expect(el._dataPlaneLive).toBe(true);
+    expect(upstream.live()).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  it("relay: rapid toggling while recording ends with exactly one live session, fed by the mic", async () => {
+    const { upstream, ctrl, relay, el, mic, errors } = relayWithUpstream();
+    await synced(el);
+    await el.start();
+    const serverStart = vi.spyOn(ctrl.core, "start");
+
+    void el.stop();
+    void el.start(); // superseded by the next stop() before it is ever sent
+    void el.stop();
+    await el.start();
+    await settle();
+
+    expect(errors).toEqual([]);
+    expect(serverStart).toHaveBeenCalledTimes(1); // the superseded start never reached the server
+    expect(ctrl.core.recognizing).toBe(true);
+    expect(upstream.opened()).toBe(2);
+    expect(upstream.live()).toBe(1);
+    expect(relay.sessionCount()).toBe(1);
+    expect(el._startMic).toHaveBeenCalledTimes(2);
+    mic.frame([5]);
+    expect(upstream.conns[1].fed).toEqual([[5]]);
+  });
+
+  it.each(["abort", "reset", "disconnect"] as const)(
+    "relay: a start() waiting behind stop() and then cancelled by %s leaves nothing running",
+    async (cancel) => {
+      const { upstream, ctrl, relay, el, errors } = relayWithUpstream({ holdStop: true });
+      await synced(el);
+      await el.start();
+      const serverStart = vi.spyOn(ctrl.core, "start");
+
+      void el.stop();
+      const started = el.start();
+      if (cancel === "disconnect") {
+        el.remove();    // disposes the proxy, closes the control socket…
+        ctrl.dispose(); // …which the integrator's `close` handler turns into a dispose
+      } else {
+        el[cancel]();
+      }
+      await started;
+      await settle();
+
+      expect(serverStart).not.toHaveBeenCalled();
+      expect(el._startMic).toHaveBeenCalledTimes(1); // the first session's only
+      expect(el._dataPlaneLive).toBe(false);
+      expect(ctrl.core.recognizing).toBe(false);
+      expect(upstream.live()).toBe(0);
+      expect(relay.sessionCount()).toBe(0);
+      expect(errors).toEqual([]);
+    },
+  );
+
+  it("relay: a session started by someone else on the same Core still gets \"already active\" after the wait", async () => {
+    const { upstream, ctrl, el } = relayWithUpstream({ holdStop: true });
+    await synced(el);
+    await el.start();
+    const abort = vi.spyOn(ctrl.core, "abort");
+    // Another party starts a session the moment this element's stop settles —
+    // before the element's own (waiting) start reaches the server.
+    ctrl.core.addEventListener("ami-voice:recognizing-changed", function restart(e) {
+      if ((e as CustomEvent).detail !== false) return;
+      ctrl.core.removeEventListener("ami-voice:recognizing-changed", restart);
+      void ctrl.core.start();
+    });
+
+    const stopped = el.stop();
+    const started = el.start();
+    await settle(); // the stop reached the server and is draining
+    upstream.releaseStops();
+    await stopped;
+    await started;
+    await settle();
+
+    expect((el.error as { message: string }).message).toMatch(/already active/);
+    expect(el._dataPlaneLive).toBe(false);
+    expect(el._startMic).toHaveBeenCalledTimes(1);
+    expect(abort).not.toHaveBeenCalled();
+    expect(ctrl.core.recognizing).toBe(true); // the other session was left alone
+  });
+
+  // ── in-page Core (local / direct) ───────────────────────────────────────────
+
+  /** Local mode: the in-page provider runs the real session loop over `upstream`. */
+  function localWithUpstream(opts?: { holdStop?: boolean }) {
+    const upstream = fakeUpstream(opts);
+    vi.spyOn(AmiVoiceProvider.prototype, "openRealtimeSession").mockImplementation(
+      (_options, handlers) => runRealtimeSession(
+        upstream.socketFactory("wss://amivoice.test/v1/"), "s LSB16K -a-general authorization=K", handlers, 5000,
+      ),
+    );
+    const el = document.createElement("ami-voice") as Shell;
+    el.setAttribute("mode", "local");
+    document.body.appendChild(el);
+    const mic = stubMic(el);
+    const errors = errorsOf(el);
+    return { upstream, el, mic, errors };
+  }
+
+  /** Direct mode: the server mints; the in-page Core opens `upstream` as the browser WebSocket. */
+  function directWithUpstream(opts?: { holdStop?: boolean }) {
+    const upstream = fakeUpstream(opts);
+    const AMIVOICE = "wss://amivoice.test/v1/";
+    const Upstream = upstream.WebSocketClass;
+    vi.stubGlobal("WebSocket", class {
+      static readonly OPEN = 1;
+      constructor(url: string, protocols?: unknown) {
+        // The browser's AmiVoice WSS → the fake upstream; the control channel stays inert.
+        return (url === AMIVOICE ? new Upstream(url) : new InertWebSocket(url, protocols)) as never;
+      }
+    });
+    const server = relayServer(() => ({
+      openRealtimeSession: async () => { throw new Error("not in direct"); },
+      recognizeFile: async () => [],
+      prepareDirectSession: async (): Promise<DirectSessionInfo> => ({
+        endpoint: AMIVOICE, sCommand: "s LSB16K -a-general authorization=ONE-TIME",
+      }),
+    }), "direct");
+    const el = mount(server.pair, { transport: "direct" });
+    const mic = stubMic(el);
+    const errors = errorsOf(el);
+    return { upstream, el, mic, errors };
+  }
+
+  const inPage = { local: localWithUpstream, direct: directWithUpstream } as const;
+  const inPageCases = (["local", "direct"] as const).flatMap((mode) => CANCELS.map((cancel) => [mode, cancel] as const));
+
+  it.each(inPageCases)("%s: %s() then an immediate start() records into a NEW session; nothing is orphaned", async (mode, cancel) => {
+    const { upstream, el, mic, errors } = inPage[mode]();
+    await el.start();
+    expect(el.recognizing).toBe(true);
+    expect(upstream.live()).toBe(1);
+
+    const cancelled = el[cancel]();
+    await el.start();
+    await cancelled;
+    await settle(); // let the first upstream's (late) close land
+
+    expect(errors).toEqual([]);
+    expect(el.recognizing).toBe(true);
+    expect(coreSession(el._core)).not.toBeNull();
+    expect(el._dataPlaneLive).toBe(true);
+    expect(el._startMic).toHaveBeenCalledTimes(2);
+    expect(upstream.opened()).toBe(2);
+    expect(upstream.live()).toBe(1);
+    expect(upstream.conns[1].open).toBe(true);
+    mic.frame([3]);
+    expect(upstream.conns[0].fed).toEqual([]);
+    expect(upstream.conns[1].fed).toEqual([[3]]);
+    expect(el.transcript).toBe(cancel === "stop" ? "こんにちは" : "");
+
+    await el.stop();
+    await settle();
+    expect(upstream.live()).toBe(0);
+  });
+
+  it.each(["local", "direct"] as const)(
+    "%s: the start is held while the stop drains, and never arms the mic for the stopping session",
+    async (mode) => {
+      const { upstream, el, errors } = inPage[mode]({ holdStop: true });
+      await el.start();
+      const coreStart = vi.spyOn(el._core as unknown as { start(): Promise<unknown> }, "start");
+
+      const stopped = el.stop();
+      const started = el.start();
+      await settle();
+
+      expect(coreStart).not.toHaveBeenCalled();
+      expect(el._startMic).toHaveBeenCalledTimes(1); // not re-armed for the draining session
+      expect(errors).toEqual([]);
+
+      upstream.releaseStops();
+      await stopped;
+      await started;
+      await settle();
+
+      expect(coreStart).toHaveBeenCalledTimes(1);
+      expect(el._startMic).toHaveBeenCalledTimes(2);
+      expect(el.recognizing).toBe(true);
+      expect(el.transcript).toBe("こんにちは");
+      expect(upstream.live()).toBe(1);
+      expect(errors).toEqual([]);
+    },
+  );
 });

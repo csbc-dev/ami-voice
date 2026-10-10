@@ -21,6 +21,10 @@
   <h1>ami-voice relay e2e</h1>
   <button id="start">start</button>
   <button id="stop">stop</button>
+  <!-- "Start over": cancel and start again in one click, without awaiting (SPEC §10.2). -->
+  <button id="restart-stop">stop + start</button>
+  <button id="restart-abort">abort + start</button>
+  <button id="restart-reset">reset + start</button>
   <!-- State mirrored here so Playwright asserts on observable DOM. -->
   <output id="interim"></output>
   <output id="transcript"></output>
@@ -67,6 +71,9 @@
       void av.start();
     });
     out("stop").addEventListener("click", () => { void av.stop(); });
+    for (const cancel of ["stop", "abort", "reset"]) {
+      out(`restart-${cancel}`).addEventListener("click", () => { void av[cancel](); void av.start(); });
+    }
 
     // Expose for direct driving from page.evaluate if needed.
     window.__av = av;

@@ -1,6 +1,7 @@
 import { raiseError } from "../raiseError.js";
 import { readProcessEnv } from "../processEnv.js";
 import { AmiVoiceError } from "../errorCodes.js";
+import { registerKnownSecret } from "../redact.js";
 import { buildStartCommand, toSegment } from "../protocol/wnnProtocol.js";
 import {
   runRealtimeSession, wrapWebSocket, DEFAULT_CONNECT_TIMEOUT_MS, type RealtimeSocket,
@@ -80,6 +81,14 @@ export class AmiVoiceProvider implements IAmiVoiceProvider {
     this._pollTimeoutMs = options.pollTimeoutMs ?? 1_800_000;
     this._socketFactory = options.socketFactory ?? wrapWebSocket;
     this._fetch = options.fetch ?? ((globalThis as { fetch?: typeof fetch }).fetch as typeof fetch);
+    // The APPKEY rides the `s` command (`authorization=`), the async poll's
+    // `Authorization: Bearer` header and the HTTP forms (`u=`); the service
+    // password rides the issuance form (`spw=`). A failure can quote any of them
+    // — an upstream echo, a fetch error holding its request, a job's JSON reply.
+    // Registered by value, every redaction choke-point (toError / originalError,
+    // the wire projection, the server log) removes them in any of those forms.
+    registerKnownSecret(this._appKey);
+    registerKnownSecret(this._servicePassword);
   }
 
   /** Realtime endpoint for a session (logging vs no-logging). */

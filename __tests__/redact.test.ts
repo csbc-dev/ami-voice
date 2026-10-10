@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import vm from "node:vm";
-import { redactSecrets, redactErrorInPlace } from "../src/redact";
+import { redactSecrets, redactErrorInPlace, registerKnownSecret } from "../src/redact";
 import { toError, toSerializedError } from "../src/normaliseError";
 import { AmiVoiceError } from "../src/errorCodes";
 import type { SerializedError } from "../src/types";
@@ -29,6 +29,174 @@ describe("redactSecrets", () => {
   it("is idempotent and leaves other text alone", () => {
     expect(redactSecrets(REDACTED)).toBe(REDACTED);
     expect(redactSecrets("connect ECONNREFUSED 10.0.0.5:443")).toBe("connect ECONNREFUSED 10.0.0.5:443");
+  });
+});
+
+/**
+ * The APPKEY in the forms the HTTP side of the provider sends it in (SPEC §14):
+ * the async poll's `Authorization: Bearer <APPKEY>` header, the `u=<APPKEY>`
+ * field of the enqueue / issuance forms, and both inside JSON — none of them
+ * an `authorization=` the original rule knew. These keys are never registered
+ * by value, so only the patterns are at work here.
+ */
+describe("redactSecrets — the HTTP forms of a credential (patterns)", () => {
+  const TOKEN = "Pq7-Vx2.APPKEY_9~a+b/c==";
+
+  it.each([
+    ["the poll header", `Authorization: Bearer ${TOKEN}`, "Authorization: Bearer <redacted>"],
+    ["lower case", `authorization: bearer ${TOKEN}`, "authorization: bearer <redacted>"],
+    ["upper case", `AUTHORIZATION: BEARER ${TOKEN}`, "AUTHORIZATION: BEARER <redacted>"],
+    ["the header value alone (a header map entry)", `Bearer ${TOKEN}`, "Bearer <redacted>"],
+    ["a tab and a URL-encoded token", `Bearer\tab%2Bcd%2F12%3D%3D rejected`, "Bearer\t<redacted> rejected"],
+    ["an inspected header map", `{ Authorization: 'Bearer ${TOKEN}', accept: '*/*' }`, "{ Authorization: 'Bearer <redacted>', accept: '*/*' }"],
+    ["in a message", `poll failed (Bearer ${TOKEN}) after 3 tries`, "poll failed (Bearer <redacted>) after 3 tries"],
+    ["after authorization=", `authorization=Bearer ${TOKEN}`, "authorization=<redacted> <redacted>"],
+  ])("Bearer: %s", (_label, input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+  });
+
+  it.each([
+    ["at the start of a form body", `u=${TOKEN}&d=-a-general`, "u=<redacted>&d=-a-general"],
+    ["after &", `d=-a-general&u=${TOKEN}&c=LSB16K`, "d=-a-general&u=<redacted>&c=LSB16K"],
+    ["at the end", `epi=30&u=${TOKEN}`, "epi=30&u=<redacted>"],
+    ["in a query string", `https://acp-api.amivoice.com/v1/recognize?u=${TOKEN}&d=-a-general`, "https://acp-api.amivoice.com/v1/recognize?u=<redacted>&d=-a-general"],
+    ["before a fragment", `/recognize?u=${TOKEN}#x`, "/recognize?u=<redacted>#x"],
+    ["after whitespace", `body: u=${TOKEN} sent`, "body: u=<redacted> sent"],
+    ["upper case", `U=${TOKEN}&d=x`, "U=<redacted>&d=x"],
+    ["URL-encoded", "u=Pq7%2BVx2%2FAPPKEY%3D9&epi=30", "u=<redacted>&epi=30"],
+    ["the service password", "sid=svc-1&spw=s3cr%26t&epi=30", "sid=svc-1&spw=<redacted>&epi=30"],
+    ["every occurrence", `u=${TOKEN}&u=${TOKEN}`, "u=<redacted>&u=<redacted>"],
+  ])("u= / spw=: %s", (_label, input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+  });
+
+  it.each([
+    ["a member u", `{"u":"${TOKEN}","d":"-a-general"}`, `{"u":"<redacted>","d":"-a-general"}`],
+    ["spaces around the colon", `{ "spw" : "pw-1", "sid": "svc-1" }`, `{ "spw" : "<redacted>", "sid": "svc-1" }`],
+    ["a serialized header map", JSON.stringify({ headers: { Authorization: `Bearer ${TOKEN}` } }), `{"headers":{"Authorization":"<redacted>"}}`],
+    ["an authorization member", `{"authorization":"${TOKEN}"}`, `{"authorization":"<redacted>"}`],
+    ["a form body as a JSON string", JSON.stringify({ body: `u=${TOKEN}&epi=30` }), `{"body":"u=<redacted>&epi=30"}`],
+    ["JSON inside a JSON string", JSON.stringify({ message: JSON.stringify({ u: TOKEN }) }), `{"message":"{\\"u\\":\\"<redacted>\\"}"}`],
+  ])("JSON: %s", (_label, input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+  });
+
+  it("an async job reply quoting the request", () => {
+    const reply = JSON.stringify({
+      code: "-", message: `invalid parameter: u=${TOKEN}`, request: { headers: [["Authorization", `Bearer ${TOKEN}`]] },
+    });
+    expect(redactSecrets(reply)).not.toContain(TOKEN);
+  });
+
+  it.each([
+    "menu=main&tofu=1&lieu=2",
+    "x.u=1 a-u=2 a_u=3",
+    `{"menu":"x","uu":"y","ux":"z"}`,
+    "d=-a-general profileId=p1 loggingOptOut=True",
+    "https://acp-api-async.amivoice.com/v2/recognitions/JOB-1",
+    "connect ECONNREFUSED 10.0.0.5:443",
+    "async enqueue failed (HTTP 401)",
+    "Bearer",
+    "Bearer\nnext line",
+    "cupbearer of the king",
+    "authorization header missing",
+    `{"u":""}`,
+  ])("leaves %j alone", (text) => {
+    expect(redactSecrets(text)).toBe(text);
+  });
+
+  it("is idempotent on every form, and keeps the earlier output for authorization=", () => {
+    const inputs = [
+      `Authorization: Bearer ${TOKEN}`, `u=${TOKEN}&d=x`, `{"u":"${TOKEN}"}`,
+      JSON.stringify({ message: JSON.stringify({ u: TOKEN }) }), `authorization=Bearer ${TOKEN}`,
+      `s LSB16K -a-general authorization=${TOKEN}`,
+    ];
+    for (const input of inputs) {
+      const once = redactSecrets(input);
+      expect(once).not.toContain(TOKEN);
+      expect(redactSecrets(once)).toBe(once);
+    }
+    expect(redactSecrets(`s LSB16K -a-general authorization=${TOKEN}`)).toBe(`s LSB16K -a-general ${REDACTED}`);
+    expect(redactSecrets(`Authorization=${TOKEN}`)).toBe(REDACTED);
+  });
+});
+
+/**
+ * Known values: the provider (and the server helper) register the APPKEY /
+ * service password they hold, and every form of that value is redacted,
+ * whatever label (or none) surrounds it. Each test uses its own value — the
+ * registry is process-wide and permanent.
+ */
+describe("redactSecrets — registered secrets (by value)", () => {
+  it("redacts a registered value in any context, labelled or not", () => {
+    const key = "VAL1-Pq7Vx2-APPKEY";
+    expect(redactSecrets(`invalid appkey ${key}`)).toBe(`invalid appkey ${key}`); // not yet known
+    registerKnownSecret(key);
+    expect(redactSecrets(`invalid appkey ${key}`)).toBe("invalid appkey <redacted>");
+    expect(redactSecrets(`x${key}y`)).toBe("x<redacted>y");
+    expect(redactSecrets(`Content-Disposition: form-data; name="u"\r\n\r\n${key}\r\n--b`))
+      .toBe(`Content-Disposition: form-data; name="u"\r\n\r\n<redacted>\r\n--b`);
+    expect(redactSecrets(`{ u: '${key}' }`)).toBe("{ u: '<redacted>' }");
+    expect(redactSecrets(`authorization=${key} rejected`)).toBe("authorization=<redacted> rejected");
+  });
+
+  it("redacts its URL-encoded (both escape cases, both encoders) and JSON-escaped forms", () => {
+    const key = "VAL2+Pq7/Vx2=AP KEY\"x";
+    registerKnownSecret(key);
+    const uri = encodeURIComponent(key);
+    const form = new URLSearchParams([["", key]]).toString().slice(1);
+    expect(uri).not.toBe(form); // the space: %20 vs +
+    const lowerHex = (s: string): string => s.replace(/%[0-9A-F]{2}/g, (h) => h.toLowerCase());
+    for (const encoded of [uri, form, lowerHex(uri), lowerHex(form)]) {
+      expect(redactSecrets(`issuance failed: sid=x&ipa=1&k=${encoded}&epi=30`)).toBe("issuance failed: sid=x&ipa=1&k=<redacted>&epi=30");
+    }
+    expect(redactSecrets(JSON.stringify({ key }))).toBe(`{"key":"<redacted>"}`);
+    expect(redactSecrets(JSON.stringify({ text: `echo ${key}` }))).toBe(`{"text":"echo <redacted>"}`);
+  });
+
+  it("replaces the longer of two overlapping secrets whole", () => {
+    registerKnownSecret("VAL3-ABCDEFGH");
+    registerKnownSecret("VAL3-ABCDEFGH-1234");
+    expect(redactSecrets("VAL3-ABCDEFGH-1234 / VAL3-ABCDEFGH")).toBe("<redacted> / <redacted>");
+  });
+
+  it("ignores what it must not register: short values, non-strings, values overlapping the placeholder", () => {
+    registerKnownSecret("short7!");
+    registerKnownSecret(undefined);
+    registerKnownSecret(null);
+    registerKnownSecret(12345678 as unknown as string);
+    registerKnownSecret("redacted");
+    registerKnownSecret("ted>abcd");
+    registerKnownSecret("wxyz<red");
+    expect(redactSecrets("short7! 12345678 redacted ted>abcd wxyz<red")).toBe("short7! 12345678 redacted ted>abcd wxyz<red");
+    expect(redactSecrets("<redacted>abcd wxyz<redacted>")).toBe("<redacted>abcd wxyz<redacted>");
+  });
+
+  it("a value with no URL encoding (a lone surrogate) is still registered as it is", () => {
+    const key = "VAL4-\uD800-ABCDEFGH";
+    expect(() => registerKnownSecret(key)).not.toThrow();
+    expect(redactSecrets(`echo ${key}`)).toBe("echo <redacted>");
+  });
+
+  it("registering a value twice changes nothing; the output stays idempotent", () => {
+    const key = "VAL5-Pq7Vx2-APPKEY";
+    registerKnownSecret(key);
+    registerKnownSecret(key);
+    const once = redactSecrets(`Authorization: Bearer ${key} / u=${encodeURIComponent(key)} / ${key}`);
+    expect(once).toBe("Authorization: Bearer <redacted> / u=<redacted> / <redacted>");
+    expect(redactSecrets(once)).toBe(once);
+  });
+
+  it("toError redacts it from the cause chain and plain data, where no label is left (a header map's value, a form field)", () => {
+    const key = "VAL6-Pq7+Vx2/APPKEY=";
+    registerKnownSecret(key);
+    const request = { headers: { Authorization: `Bearer ${key}` }, form: { u: key }, body: `u=${encodeURIComponent(key)}` };
+    const err = withCause(new TypeError("fetch failed"), Object.assign(new Error("POST /v2/recognitions failed"), { request }));
+
+    expect(toError(err)).toBe(err);
+    expect(leaksOfSecret(err, key)).toEqual([]);
+    expect(leaksOfSecret(err, encodeURIComponent(key))).toEqual([]);
+    expect(request.form.u).toBe(key); // the caller's own object is not edited
   });
 });
 

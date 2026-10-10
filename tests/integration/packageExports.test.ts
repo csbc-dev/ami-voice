@@ -33,10 +33,39 @@ describe("built package: redactSecrets on @csbc-dev/ami-voice/server", () => {
     expect(JSON.parse(out)).toStrictEqual(["function", "s LSB16K -a-general authorization=<redacted>"]);
   });
 
+  it("redacts the HTTP forms, and the APPKEY of a provider constructed in the process by value", () => {
+    const out = runModule(`
+      import { redactSecrets, AmiVoiceProvider } from "@csbc-dev/ami-voice/server";
+      const before = redactSecrets("echo PERMANENT-APPKEY-9f3a");
+      new AmiVoiceProvider({ appKey: "PERMANENT-APPKEY-9f3a" });
+      process.stdout.write(JSON.stringify([
+        redactSecrets("Authorization: Bearer K1 / u=K2&d=-a-general"),
+        before,
+        redactSecrets("echo PERMANENT-APPKEY-9f3a"),
+      ]));
+    `);
+    expect(JSON.parse(out)).toStrictEqual([
+      "Authorization: Bearer <redacted> / u=<redacted>&d=-a-general",
+      "echo PERMANENT-APPKEY-9f3a",
+      "echo <redacted>",
+    ]);
+  });
+
   it("is typed in dist/server.d.ts and absent from the browser entry", () => {
     expect(readFileSync(join(root, "dist/server.d.ts"), "utf8")).toMatch(/\bredactSecrets\b/);
     for (const file of ["dist/index.js", "dist/index.d.ts"]) {
       expect(readFileSync(join(root, file), "utf8")).not.toMatch(/\bredactSecrets\b/);
+    }
+  });
+
+  it("does not expose the value registry (registerKnownSecret) from either entry", () => {
+    const out = runModule(`
+      const server = await import("@csbc-dev/ami-voice/server");
+      process.stdout.write(JSON.stringify("registerKnownSecret" in server));
+    `);
+    expect(JSON.parse(out)).toBe(false);
+    for (const file of ["dist/server.d.ts", "dist/index.d.ts"]) {
+      expect(readFileSync(join(root, file), "utf8")).not.toMatch(/\bregisterKnownSecret\b/);
     }
   });
 });

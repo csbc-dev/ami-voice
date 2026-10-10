@@ -6,7 +6,7 @@
 //   - `AmiVoiceCore`     (the wcBindable Core that holds the APPKEY-bearing provider)
 //   - `AmiVoiceProvider` (default provider; reads AMIVOICE_APPKEY)
 //   - the WSS command/event protocol helpers, and types
-//   - `redactSecrets`    (APPKEY redaction for the application's own logs)
+//   - `redactSecrets`    (APPKEY / credential redaction for the application's own logs)
 //
 // The Shell, mic capture, and the binary audio channel stay in the default barrel.
 export { AmiVoiceCore } from "./core/AmiVoiceCore.js";
@@ -22,8 +22,10 @@ export type {
 } from "./createAmiVoiceServer.js";
 export { AmiVoiceError, mapResultCode, isClientError, getErrorCode } from "./errorCodes.js";
 export type { AmiVoiceErrorCode } from "./errorCodes.js";
-// Redacts `authorization=<token>` — what an `s` command or its echo carries —
-// for strings the application logs itself (SPEC §14). Server-only on purpose,
+// Redacts the APPKEY — by value once a provider holds it, and in the
+// `authorization=` / `Bearer` / `u=` forms an `s` command, a request or their
+// echo carries — for strings the application logs itself (SPEC §14). The value
+// registry behind it (`registerKnownSecret`) stays internal. Server-only on purpose,
 // NOT mirrored in the default barrel: the permanent APPKEY and the logs that
 // must not show it live on the server.
 export { redactSecrets } from "./redact.js";

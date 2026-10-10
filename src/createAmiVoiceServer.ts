@@ -2,7 +2,8 @@ import { AmiVoiceCore } from "./core/AmiVoiceCore.js";
 import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
 import type { IAmiVoiceProvider, AmiVoiceTransport, SerializedError } from "./types.js";
 import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
-import { redactSecrets } from "./redact.js";
+import { redactSecrets, registerKnownSecret } from "./redact.js";
+import { readProcessEnv } from "./processEnv.js";
 import {
   RemoteShellProxy, type ServerTransport, type ServerMessage, type RemoteSerializedError,
 } from "@wc-bindable/remote";
@@ -124,10 +125,18 @@ function toUint8(data: unknown): Uint8Array | null {
  * server's internals (`connect ECONNREFUSED 10.0.0.5:443`, downstream error
  * payloads, a custom provider's diagnostics); `toError` redacts only the APPKEY
  * from it.
+ *
+ * The strings that do cross are redacted (`redactSecrets`) here as well: a
+ * rejection the Core builds with `toError` already is, but a command can throw
+ * past it (a custom session's `abort()`), and its `message` would otherwise be
+ * sent as it is.
  */
 function forTheBrowser(error: unknown): unknown {
   if (typeof error !== "object" || error === null || Array.isArray(error)) return error;
   const { stack: _stack, cause: _cause, ...rest } = error as Record<string, unknown>;
+  for (const [key, value] of Object.entries(rest)) {
+    if (typeof value === "string") rest[key] = redactSecrets(value);
+  }
   return rest;
 }
 
@@ -184,6 +193,10 @@ export function createAmiVoiceRelayServer(
   const epi = options.epi ?? 30;
   const epiWithoutIpa = options.epiWithoutIpa ?? 10;
   const log: AmiVoiceServerLogger = options.logger ?? (() => { /* no-op */ });
+  // The default provider registers its own secrets; these cover a custom one
+  // that reads the same environment (redact.ts, `registerKnownSecret`).
+  registerKnownSecret(readProcessEnv("AMIVOICE_APPKEY"));
+  registerKnownSecret(readProcessEnv("AMIVOICE_SERVICE_PASSWORD"));
 
   return {
     handleControlConnection(

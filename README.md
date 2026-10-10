@@ -158,22 +158,31 @@ wss.on("connection", (sock) => {
 
 - It changes together with `error`: it is set before the Core dispatches `ami-voice:error`, and it is `null` whenever `error` is.
 - It is what the Core caught from the provider / session, passed through the same normalization as a direct-mode rejection: an `Error` stays the same instance; a frozen `Error`, a plain object or a string becomes an `Error` with the same `name` / `message` / `code` / `resultCode` / `retryable`.
-- An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted from the whole instance — `message`, `stack`, every `cause` in the chain and the extra fields (and the objects / arrays under them) — so you can hand it to a tracker as it is. The `Error`s are redacted in place (same instance, class, `stack` and chain); a plain object holding the APPKEY is swapped for a redacted copy rather than edited, since it may be your provider's own state. If the APPKEY sits where it cannot be overwritten (a frozen `cause`, a read-only field), you get a new `Error` like the frozen case above, without `cause`. Redaction recognizes the `authorization=<token>` form only and does not look inside class instances other than `Error` — a custom provider should not put the APPKEY anywhere else.
+- An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted from the whole instance — `message`, `stack`, every `cause` in the chain and the extra fields (and the objects / arrays under them) — so you can hand it to a tracker as it is. The `Error`s are redacted in place (same instance, class, `stack` and chain); a plain object holding the APPKEY is swapped for a redacted copy rather than edited, since it may be your provider's own state. If the APPKEY sits where it cannot be overwritten (a frozen `cause`, a read-only field), you get a new `Error` like the frozen case above, without `cause`. Redaction follows `redactSecrets` (below) and does not look inside class instances other than `Error` (`Headers`, `FormData`, responses, …) — a custom provider should not put the APPKEY there.
 - It covers only failures published on `error`. A call that fails instead — a direct-mode mint failure, any other failed call — does not set it; that one is in the `logger`'s `error` record, with `stack` and `cause`.
 - It is **not** declared in `AmiVoiceCore.wcBindable`. `@wc-bindable/remote` sends and accepts only declared names, so it never crosses the control channel and a client cannot invoke or set it.
 
 ### Redacting your own logs: `redactSecrets`
 
-The rule the package applies to every error and log record is exported from the server entry, for the strings you log yourself — your custom provider's diagnostics, a wrapper around the `logger`, anything that may quote an `s` command or its echo:
+The rule the package applies to every error and log record is exported from the server entry, for the strings you log yourself — your custom provider's diagnostics, a wrapper around the `logger`, anything that may quote an `s` command, a request, or their echo:
 
 ```js
 import { redactSecrets } from "@csbc-dev/ami-voice/server";
 
 redactSecrets("s LSB16K -a-general authorization=XXXXXXXX");
 // → "s LSB16K -a-general authorization=<redacted>"
+redactSecrets("GET /v2/recognitions/1 (Authorization: Bearer XXXXXXXX)");
+// → "GET /v2/recognitions/1 (Authorization: Bearer <redacted>)"
+redactSecrets("POST /issue_service_authorization u=XXXXXXXX&epi=30");
+// → "POST /issue_service_authorization u=<redacted>&epi=30"
 ```
 
-It replaces every `authorization=<token>` (case-insensitive, up to the next whitespace) and leaves an already redacted string unchanged. It does not know the APPKEY value itself, so a key in any other form passes through. It is server-only: the browser entry (`@csbc-dev/ami-voice`) does not export it.
+What it redacts, in this order:
+
+- **The APPKEY by value.** Every `AmiVoiceProvider` registers its APPKEY (and service password) when it is constructed, and `createAmiVoiceRelayServer` registers `AMIVOICE_APPKEY` / `AMIVOICE_SERVICE_PASSWORD`. That value becomes `<redacted>` wherever it appears — bare, URL-encoded or JSON-escaped, with any label or none. Values shorter than 8 characters are not registered. The registry is internal; there is no API to add your own values.
+- **Labelled forms**, for credentials the process does not hold (a custom provider's key, a one-time APPKEY), case-insensitive: `authorization=<token>` (the realtime `s` command; output unchanged from earlier releases), `Bearer <token>` (the async poll's `Authorization` header), the form / query fields `u=` and `spw=` (the async enqueue and the one-time APPKEY issuance), and the JSON members `"u"` / `"spw"` / `"authorization"`.
+
+An already redacted string is returned unchanged. The labelled forms err on the side of redacting: the word after `bearer` and an unrelated `u=` field are redacted too. Without a label, only a registered value is caught — so a custom provider that does not use `AmiVoiceProvider` should keep its key out of its errors. It is server-only: the browser entry (`@csbc-dev/ami-voice`) does not export it.
 
 ## Package entry points
 

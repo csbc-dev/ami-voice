@@ -128,7 +128,9 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each as 
 
 ### Structured logging
 
-`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and errors: those the Core publishes, those sent to the browser as a failed call (e.g. a direct-mode mint failure), and those the helper catches in its own socket callbacks instead of letting them crash the process (e.g. a custom provider's session whose `abort()` throws when `dispose()` runs). Records never contain the APPKEY, the audio token, or wire payloads.
+`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and errors: those the Core publishes, those sent to the browser as a failed call (e.g. a direct-mode mint failure), and those the helper catches in its own socket callbacks instead of letting them crash the process (e.g. a custom provider's session whose `abort()` throws, or a custom control transport whose `dispose()` throws, when `dispose()` runs — both still run). Records never contain the APPKEY, the audio token, or wire payloads.
+
+A logger that throws loses that record, nothing else: the helper catches the throw wherever it logs from (socket callbacks, the Core's event dispatch, `handleControlConnection` / `handleAudioConnection` / `dispose()`), and the session, the reply to the browser and the teardown go on.
 
 Server internals stay on the server: the browser gets a failed call's `name` / `message` / `code` without the `stack` or the `cause` chain, and the `error` record carries both (redacted) instead.
 
@@ -151,11 +153,14 @@ const relay = createAmiVoiceRelayServer({ logger });   // routine records → yo
 wss.on("connection", (sock) => {
   const { core } = relay.handleControlConnection(new WebSocketServerTransport(sock));
   core.addEventListener("ami-voice:error", () => {
-    if (core.originalError) tracker.captureException(core.originalError);   // the exception → your tracker
+    try {
+      if (core.originalError) tracker.captureException(core.originalError);   // the exception → your tracker
+    } catch { /* a tracker that fails must not take the server down (below) */ }
   });
 });
 ```
 
+- **Catch inside your listener.** A listener you add on `core` (this one, or any `ami-voice:*`) runs inside the Core's event dispatch. On Node, `EventTarget` reports a listener's throw — and an `async` listener's rejection — as the process's `uncaughtException` once the dispatch is over, and Node exits by default. The package cannot catch it: `dispatchEvent` returns normally, so the Core, the `logger` and the browser carry on, and only your process is at risk. Wrap the listener's body in `try` / `catch` (as above; for an `async` listener, its `await`s too). Don't rely on `process.on("uncaughtException")` instead: Node does not support resuming normal operation after it.
 - It changes together with `error`: it is set before the Core dispatches `ami-voice:error`, and it is `null` whenever `error` is.
 - It is what the Core caught from the provider / session, passed through the same normalization as a direct-mode rejection: an `Error` stays the same instance; a frozen `Error`, a plain object or a string becomes an `Error` with the same `name` / `message` / `code` / `resultCode` / `retryable`.
 - An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted from the whole instance — `message`, `stack`, every `cause` in the chain and the extra fields (and the objects / arrays under them) — so you can hand it to a tracker as it is. The `Error`s are redacted in place (same instance, class, `stack` and chain); a plain object holding the APPKEY is swapped for a redacted copy rather than edited, since it may be your provider's own state. If the APPKEY sits where it cannot be overwritten (a frozen `cause`, a read-only field), you get a new `Error` like the frozen case above, without `cause`. Redaction follows `redactSecrets` (below) and does not look inside class instances other than `Error` (`Headers`, `FormData`, responses, …) — a custom provider should not put the APPKEY there.

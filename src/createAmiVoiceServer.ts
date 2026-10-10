@@ -51,10 +51,12 @@ import {
  *
  * It is also logged for a throw the helper catches in its own socket callbacks
  * rather than let it reach the server process (SPEC §17, §18): a custom
- * provider's session whose `abort()` throws when `dispose()` runs, and anything
- * escaping `core.feedAudio` in the audio listener (once per audio connection;
- * by design nothing does). That record carries the redacted `message`, the
- * `code` and, for an `Error`, the redacted `stack`.
+ * provider's session whose `abort()` throws when `dispose()` runs, a control
+ * transport whose `dispose()` throws (when `dispose()` runs, or when the shell
+ * disposes itself on the transport's close), and anything escaping
+ * `core.feedAudio` in the audio listener (once per audio connection; by design
+ * nothing does). That record carries the redacted `message`, the `code` and,
+ * for an `Error`, the redacted `stack`.
  */
 export type AmiVoiceServerLogEvent =
   | { type: "control-open"; transport: AmiVoiceTransport; peerAddress?: string }
@@ -63,7 +65,11 @@ export type AmiVoiceServerLogEvent =
   | { type: "audio-rejected"; reason: "unknown-session" }
   | { type: "error"; code?: AmiVoiceErrorCode; message: string; stack?: string; cause?: string };
 
-/** Injectable structured logger (Phase 3.5). Default is a no-op. */
+/**
+ * Injectable structured logger (Phase 3.5). Default is a no-op. A logger that
+ * throws loses that record and nothing else: the helper catches the throw and
+ * carries on (SPEC §14).
+ */
 export type AmiVoiceServerLogger = (event: AmiVoiceServerLogEvent) => void;
 
 export interface AmiVoiceRelayServerOptions {
@@ -81,6 +87,9 @@ export interface AmiVoiceRelayServerOptions {
    * `throw` (with the server stack the browser no longer gets), and the throws
    * the helper catches in its own socket callbacks. Default: no-op.
    * Sensitive values (APPKEY, audio token, wire payloads) are never passed to it.
+   * It is called from socket and event callbacks (the control socket's `close`,
+   * the audio socket's `message`, the Core's event dispatch), so a throw from it
+   * is caught and dropped: the record is lost, the session and the reply go on.
    */
   logger?: AmiVoiceServerLogger;
 }
@@ -96,8 +105,10 @@ export interface AmiVoiceControlSession {
   shell: RemoteShellProxy;
   /**
    * Tear down: drop the session token, dispose the shell, abort the Core.
-   * Safe to call from the control socket's `close` listener: a session whose
-   * `abort()` throws (a custom provider's) is logged, not thrown.
+   * Safe to call from the control socket's `close` listener: it never throws.
+   * The shell's dispose and the Core's abort both run, whichever of them
+   * throws — a transport whose `dispose()` throws, a session whose `abort()`
+   * throws (a custom provider's) — and what they throw is logged.
    */
   dispose(): void;
 }
@@ -178,10 +189,24 @@ function forTheBrowser(error: unknown): unknown {
  * `onThrow` sees the envelope's error BEFORE stripping, so the original stack
  * and cause can go to the server log.
  *
- * TODO: remove once `@wc-bindable/remote` no longer puts `stack` / `cause` on the wire
- * (wc-bindable-protocol#38).
+ * TODO: remove the stripping once `@wc-bindable/remote` no longer puts
+ * `stack` / `cause` on the wire (wc-bindable-protocol#38).
+ *
+ * The same wrapper keeps the shell's close handler from throwing (SPEC §18).
+ * `RemoteShellProxy` disposes itself when the transport reports its close,
+ * and that dispose calls the transport's own `dispose()`, from inside the
+ * transport's socket `close` dispatch (`WebSocketServerTransport` listens
+ * before the integrator does). A `dispose()` that throws there is the server
+ * process's uncaught exception, and the socket's later `close` listeners
+ * never run — the integrator's, which calls the session's `dispose()`, so the
+ * Core would never be aborted. `onCloseThrow` logs it instead. This part stays
+ * when the TODO above is done.
  */
-function withoutThrowInternals(transport: ServerTransport, onThrow: (error: unknown) => void): ServerTransport {
+function withoutThrowInternals(
+  transport: ServerTransport,
+  onThrow: (error: unknown) => void,
+  onCloseThrow: (thrown: unknown) => void,
+): ServerTransport {
   return {
     send: (message: ServerMessage) => {
       if (message.type === "throw") {
@@ -192,7 +217,13 @@ function withoutThrowInternals(transport: ServerTransport, onThrow: (error: unkn
       transport.send(message);
     },
     onMessage: (handler) => transport.onMessage(handler),
-    onClose: (handler) => transport.onClose?.(handler),
+    onClose: (handler) => transport.onClose?.(() => {
+      try {
+        handler();
+      } catch (err) {
+        onCloseThrow(err);
+      }
+    }),
     dispose: () => transport.dispose?.(),
   };
 }
@@ -205,7 +236,22 @@ export function createAmiVoiceRelayServer(
   const transportMode: AmiVoiceTransport = options.transport ?? "relay";
   const epi = options.epi ?? 30;
   const epiWithoutIpa = options.epiWithoutIpa ?? 10;
-  const log: AmiVoiceServerLogger = options.logger ?? (() => { /* no-op */ });
+  const logger = options.logger;
+  // Every record goes through `log`, which never lets the integrator's logger
+  // throw past it (SPEC §14). Records are written from the control socket's
+  // `close` listener (`dispose()`), the audio socket's dispatch, the Core's
+  // event dispatch (`onCoreError`: Node's `EventTarget` turns a listener's
+  // throw into the process's `uncaughtException`) and the integrator's own
+  // `connection` handler, where a throw would also skip what follows the
+  // record: returning the session, closing a rejected audio socket. The
+  // logger's throw is dropped along with the record — the logger is the only
+  // sink there is.
+  const log: AmiVoiceServerLogger = (event) => {
+    if (!logger) return;
+    try {
+      logger(event);
+    } catch { /* the record is lost; the helper carries on */ }
+  };
   // The default provider registers its own secrets; these cover a custom one
   // that reads the same environment (redact.ts, `registerKnownSecret`).
   registerKnownSecret(readProcessEnv("AMIVOICE_APPKEY"));
@@ -215,7 +261,7 @@ export function createAmiVoiceRelayServer(
   // escape (the server process's uncaught exception), logged redacted instead:
   // its `message` and `code` as the Core would publish them
   // (`toSerializedError`, which also copes with a hostile value) and, for an
-  // `Error`, its `stack`. A throwing logger does not escape either.
+  // `Error`, its `stack`. Shaping it never throws past here either.
   const logThrown = (thrown: unknown): void => {
     try {
       const shaped = toSerializedError(thrown) ?? { name: "Error", message: String(thrown) };
@@ -255,7 +301,8 @@ export function createAmiVoiceRelayServer(
       }
       // The browser gets every `throw` without its server stack; the log keeps it
       // (redacted — an echoed `authorization=<APPKEY>` can sit in a stack's first
-      // line). Logging must never stop the reply from being sent.
+      // line). Logging must never stop the reply from being sent: neither the
+      // logger (`log`) nor the shaping below throws past here.
       const onThrow = (error: unknown): void => {
         try {
           const { message, stack, cause } = error as RemoteSerializedError;
@@ -270,11 +317,13 @@ export function createAmiVoiceRelayServer(
           log(record);
         } catch { /* the reply still goes out */ }
       };
-      const shell = new RemoteShellProxy(core, withoutThrowInternals(transport, onThrow));
+      const shell = new RemoteShellProxy(core, withoutThrowInternals(transport, onThrow, logThrown));
       // Log emitted Core errors (normalized code + message only — never payloads).
       // The detail is the Core's JSON-safe `SerializedError` — the same object the
       // shell forwards to the browser as the `error` update (SPEC §17). The
       // exception behind it stays on `core.originalError` for the integrator.
+      // This runs inside the Core's dispatch: on Node a throw here would be
+      // the process's `uncaughtException`, so it relies on `log` not throwing.
       const onCoreError = (e: Event): void => {
         const detail = (e as CustomEvent<SerializedError | null>).detail;
         if (detail) log({ type: "error", code: getErrorCode(detail), message: redactSecrets(detail.message) });
@@ -296,12 +345,21 @@ export function createAmiVoiceRelayServer(
           if (token) sessions.delete(token);
           core.removeEventListener("ami-voice:error", onCoreError);
           core.removeEventListener("ami-voice:recognizing-changed", onRecognizingChanged);
-          shell.dispose();
           // `dispose()` runs from the control socket's `close` listener (the
           // server's `ws` dispatch), where a throw is the server process's
-          // uncaught exception. The Core has torn down already when its
-          // `abort()` throws — a custom provider's session whose `abort()`
-          // throws (the shared loop's never does) — so the throw is only logged.
+          // uncaught exception. Each step runs whatever the one before it
+          // threw, and its own throw is only logged:
+          //  - the shell's dispose calls the integrator's transport `dispose()`,
+          //    which may throw. The Core's abort must still follow, or the
+          //    upstream AmiVoice session outlives the connection.
+          //  - the Core has torn down already when its `abort()` throws — a
+          //    custom provider's session whose `abort()` throws (the shared
+          //    loop's never does).
+          try {
+            shell.dispose();
+          } catch (err) {
+            logThrown(err);
+          }
           try {
             core.abort();
           } catch (err) {

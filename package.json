@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/ami-voice",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Declarative speech-recognition component for the AmiVoice cloud API. Server-side APPKEY, browser mic capture, two-channel relay, via wc-bindable-protocol.",
   "type": "module",
   "main": "dist/index.js",

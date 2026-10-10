@@ -193,6 +193,8 @@ import { WebSocketServerTransport, RemoteShellProxy } from "@wc-bindable/remote"
 
 > 教訓：CSBCパッケージを混ぜるときは、まず `npm ls @wc-bindable/remote` で**重複した別バージョンが無い**ことを確認しましょう。
 
+> 追記（2026-10）：その後 `@wc-bindable` 0.10 で `@wc-bindable/remote` のワイヤ検証が厳格になり（`undefined` を含む値や `Error` インスタンスを黙って変換せず、拒否するか捨てる）、両パッケージとも 0.10 系への対応を済ませました。ただし対応版が npm に出るまでは、公開済みの `ai-agent@0.2.0` / `ami-voice@0.1.x` は `^0.8` のままです。そのため今リポジトリの example（`@wc-bindable/* ^0.10.0`）をインストールすると、`npm ls @wc-bindable/remote` に 0.8 と 0.10 が並びます。対応版の公開後は、上の `package.json` を両パッケージの新しい版と `@wc-bindable/* ^0.10.0` に読み替えてください。
+
 もう一点。`@csbc-dev/ai-agent` のメインバレルは `<ai-agent>`（`extends HTMLElement`）を即時定義するため、Nodeでそのまま `import` すると `HTMLElement is not defined` で落ちます（`/server` バレルはまだ無いので 0.2.0 でも同じ）。使うのはDOMフリーな `AiCore` だけなので、最小shimを置いてから動的importします。
 
 ```js
@@ -244,7 +246,7 @@ CSBCで非同期配線を全部追い出すと、最後に**1つの判断**だ�
 
 - AmiVoiceの音声認識と生成AIの連携は、CSBCの兄弟パッケージを使うと**バインディングの配線だけ**で組めます。
 - 2つのCoreをサーバに置くことで、**APPKEYもLLMのAPIキーもブラウザに出ません**。
-- 実地のコツは「兄弟パッケージで **`@wc-bindable` のメジャー世代を揃える**（`ai-agent@0.2.0` で `0.8` に統一）」と「`AiCore` 取り込みのための `HTMLElement` shim」。
+- 実地のコツは「兄弟パッケージで **`@wc-bindable` のメジャー世代を揃える**（`ai-agent@0.2.0` で `0.8` に統一。0.10 対応版で `0.10` に揃え直す）」と「`AiCore` 取り込みのための `HTMLElement` shim」。
 - フレームワークはVanilla / Vue / React いずれでも本質は同じ（`bind()` か各アダプタに置き換わるだけ）。リポジトリには3版とも同梱しています（[`voice-llm/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm) / [`voice-llm-vue/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-vue) / [`voice-llm-react/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-react)）。この記事のスニペットは **Vue版**です。
 
 ソース一式：[`examples/voice-llm-vue/`](https://github.com/csbc-dev/ami-voice/tree/main/examples/voice-llm-vue)

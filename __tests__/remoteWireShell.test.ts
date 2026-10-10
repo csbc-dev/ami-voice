@@ -937,3 +937,88 @@ describe("<ami-voice>: start() right behind stop() / abort() / reset() starts a 
     },
   );
 });
+
+// ── engine="" / codec="" ──────────────────────────────────────────────────────
+
+/**
+ * Bug: `<ami-voice engine="">` / `el.codec = ""` forwarded "" and the Core stored
+ * it, so the `s` command was built with an empty positional token (`s  -a-general
+ * …` / `s LSB16K  authorization=…`) — while the Shell, reading "" as "no codec",
+ * streamed LSB16K. "" now resets engine / codec to the default (SPEC §7.2); each
+ * case below checks the `s` command AmiVoice actually receives.
+ */
+describe("<ami-voice> engine=\"\" / codec=\"\" mean the default in every mode (SPEC §7.2)", () => {
+  const AMIVOICE = "wss://acp-api.amivoice.com/v1/";
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it("relay: the server Core resets them, and its `s` command is well-formed", async () => {
+    const upstream = fakeUpstream();
+    const { pair, ctrl, relay } = relayServer(() => new AmiVoiceProvider({ appKey: "K", socketFactory: upstream.socketFactory }));
+    routeAudioTo(relay);
+    const el = mount(pair, { engine: "", codec: "" });
+    stubMic(el);
+    const errors = errorsOf(el);
+    await synced(el);
+    // A property write of "" resets a value set earlier, too.
+    el.codec = "MSB16K";
+    await vi.waitFor(() => expect(ctrl.core.codec).toBe("MSB16K"));
+    el.codec = "";
+    await vi.waitFor(() => expect(ctrl.core.codec).toBe("LSB16K"));
+    expect(ctrl.core.engine).toBe("-a-general");
+
+    await el.start();
+
+    expect(upstream.conns[0].start).toBe("s LSB16K -a-general authorization=K");
+    expect(el._dataPlaneLive).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  it("direct: the server Core's mint builds a well-formed `s`, which the browser sends", async () => {
+    const upstream = fakeUpstream();
+    const Upstream = upstream.WebSocketClass;
+    vi.stubGlobal("WebSocket", class {
+      static readonly OPEN = 1;
+      constructor(url: string, protocols?: unknown) {
+        // The browser's AmiVoice WSS → the fake upstream; the control channel stays inert.
+        return (url === AMIVOICE ? new Upstream(url) : new InertWebSocket(url, protocols)) as never;
+      }
+    });
+    const fetch = (async () => ({ ok: true, text: async () => "ONE-TIME" })) as unknown as typeof globalThis.fetch;
+    const { pair, ctrl } = relayServer(() => new AmiVoiceProvider({ appKey: "PERMANENT-APPKEY", fetch }), "direct");
+    const el = mount(pair, { transport: "direct", engine: "", codec: "" });
+    stubMic(el);
+    const errors = errorsOf(el);
+
+    await el.start();
+
+    expect(ctrl.core.engine).toBe("-a-general");
+    expect(ctrl.core.codec).toBe("LSB16K");
+    expect(el._core!.engine).toBe("-a-general");
+    expect(upstream.conns[0].url).toBe(AMIVOICE);
+    expect(upstream.conns[0].start).toBe("s LSB16K -a-general authorization=ONE-TIME");
+    expect(el.recognizing).toBe(true);
+    expect(errors).toEqual([]);
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+  });
+
+  it("local: the in-page Core resets them, and its `s` command is well-formed", async () => {
+    const upstream = fakeUpstream();
+    vi.stubEnv("AMIVOICE_APPKEY", "K");
+    vi.stubGlobal("WebSocket", upstream.WebSocketClass);
+    const el = document.createElement("ami-voice") as Shell;
+    el.setAttribute("mode", "local");
+    el.setAttribute("engine", "");
+    el.setAttribute("codec", "");
+    document.body.appendChild(el);
+    stubMic(el);
+    const errors = errorsOf(el);
+
+    await el.start();
+
+    expect(el._core!.engine).toBe("-a-general");
+    expect(upstream.conns[0].url).toBe(AMIVOICE);
+    expect(upstream.conns[0].start).toBe("s LSB16K -a-general authorization=K");
+    expect(el.recognizing).toBe(true);
+    expect(errors).toEqual([]);
+  });
+});

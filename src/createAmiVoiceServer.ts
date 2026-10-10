@@ -3,7 +3,9 @@ import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
 import type { IAmiVoiceProvider, AmiVoiceTransport, SerializedError } from "./types.js";
 import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
 import { redactSecrets } from "./redact.js";
-import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
+import {
+  RemoteShellProxy, type ServerTransport, type ServerMessage, type RemoteSerializedError,
+} from "@wc-bindable/remote";
 
 /**
  * Server-side realtime helper (docs/adr/0003, docs/adr/0006). Owns the per-
@@ -34,14 +36,20 @@ import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
  * union so an integrator can route by `type` to their own logger. NOTE: it never
  * carries the APPKEY (server-only) nor the raw audio session token (a bearer the
  * SPEC §11.3 keeps out of logs); `error` carries only the normalized `code` +
- * message, never wire payloads.
+ * redacted message (+ redacted server `stack`, see below), never wire payloads.
+ *
+ * `error` is logged for every error the Core publishes on `error`, AND for every
+ * remote `throw` the shell answers a browser call with (e.g. a direct-mode mint
+ * failure). For the latter, `stack` holds the server-side stack trace and
+ * `cause` the (JSON-serialized, redacted) cause chain that the helper withheld
+ * from the browser (SPEC §17).
  */
 export type AmiVoiceServerLogEvent =
   | { type: "control-open"; transport: AmiVoiceTransport; peerAddress?: string }
   | { type: "control-close"; transport: AmiVoiceTransport; peerAddress?: string }
   | { type: "audio-open" }
   | { type: "audio-rejected"; reason: "unknown-session" }
-  | { type: "error"; code?: AmiVoiceErrorCode; message: string };
+  | { type: "error"; code?: AmiVoiceErrorCode; message: string; stack?: string; cause?: string };
 
 /** Injectable structured logger (Phase 3.5). Default is a no-op. */
 export type AmiVoiceServerLogger = (event: AmiVoiceServerLogEvent) => void;
@@ -57,8 +65,9 @@ export interface AmiVoiceRelayServerOptions {
   epiWithoutIpa?: number;
   /**
    * Structured logger (Phase 3.5). Receives connection open/close, rejected audio
-   * frames, and emitted Core errors. Default: no-op. Sensitive values (APPKEY,
-   * audio token, wire payloads) are never passed to it.
+   * frames, emitted Core errors, and the errors sent to the browser as a remote
+   * `throw` (with the server stack the browser no longer gets). Default: no-op.
+   * Sensitive values (APPKEY, audio token, wire payloads) are never passed to it.
    */
   logger?: AmiVoiceServerLogger;
 }
@@ -106,6 +115,62 @@ function toUint8(data: unknown): Uint8Array | null {
   return null; // ignore text frames on the audio channel
 }
 
+/**
+ * Copy of a serialized remote error without `stack` and without `cause`. Only
+ * `name`, `message` and `code` reach the browser: a cause chain carries the
+ * server's internals (`connect ECONNREFUSED 10.0.0.5:443`, downstream error
+ * payloads, a custom provider's diagnostics) that `toError` never redacts.
+ */
+function forTheBrowser(error: unknown): unknown {
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return error;
+  const { stack: _stack, cause: _cause, ...rest } = error as Record<string, unknown>;
+  return rest;
+}
+
+/**
+ * Wrap a control transport so that no SERVER stack trace or cause reaches the browser.
+ *
+ * `@wc-bindable/remote` 0.10's `RemoteShellProxy` answers a command that throws
+ * (or rejects) with a `throw` envelope whose error carries `stack` whenever the
+ * thrown `error.stack` is a string — i.e. always, for an `Error` — and the same
+ * for every `Error` in its `cause` chain, which it forwards too; it has no option
+ * to leave either out. In
+ * direct mode every mint failure is such a throw, so the browser received the
+ * server's stack (file paths, module layout, dependency versions). `toError`
+ * redacts the APPKEY from it, but the stack itself does not belong on an
+ * untrusted wire (SPEC §17).
+ *
+ * Stripping it here — the last hop before the wire — instead of on the thrown
+ * error covers every `throw` this shell sends, whatever was thrown, by which
+ * command (or input setter), with whatever `cause` chain, and does not depend on
+ * how the shell reads `stack`. The `cause` chain is dropped as well: the spec's
+ * Security note says producers SHOULD redact it by default on an untrusted
+ * boundary. `name` / `message` / `code` cross unchanged
+ * (`resultCode` / `retryable` never ride the envelope); the thrown error itself
+ * is untouched, so an in-process caller of the Core — and the in-page Core of
+ * local mode, which never passes through this helper — keeps its full stack.
+ * `onThrow` sees the envelope's error BEFORE stripping, so the original stack
+ * and cause can go to the server log.
+ *
+ * TODO: remove once `@wc-bindable/remote` no longer puts `stack` / `cause` on the wire
+ * (wc-bindable-protocol#38).
+ */
+function withoutThrowInternals(transport: ServerTransport, onThrow: (error: unknown) => void): ServerTransport {
+  return {
+    send: (message: ServerMessage) => {
+      if (message.type === "throw") {
+        onThrow(message.error);
+        transport.send({ ...message, error: forTheBrowser(message.error) });
+        return;
+      }
+      transport.send(message);
+    },
+    onMessage: (handler) => transport.onMessage(handler),
+    onClose: (handler) => transport.onClose?.(handler),
+    dispose: () => transport.dispose?.(),
+  };
+}
+
 export function createAmiVoiceRelayServer(
   options: AmiVoiceRelayServerOptions = {},
 ): AmiVoiceRelayServer {
@@ -142,7 +207,24 @@ export function createAmiVoiceRelayServer(
           },
         });
       }
-      const shell = new RemoteShellProxy(core, transport);
+      // The browser gets every `throw` without its server stack; the log keeps it
+      // (redacted — an echoed `authorization=<APPKEY>` can sit in a stack's first
+      // line). Logging must never stop the reply from being sent.
+      const onThrow = (error: unknown): void => {
+        try {
+          const { message, stack, cause } = error as RemoteSerializedError;
+          const record: Extract<AmiVoiceServerLogEvent, { type: "error" }> = {
+            type: "error",
+            message: redactSecrets(String(message)),
+          };
+          const code = getErrorCode(error);
+          if (code) record.code = code;
+          if (typeof stack === "string") record.stack = redactSecrets(stack);
+          if (cause !== undefined) record.cause = redactSecrets(JSON.stringify(cause));
+          log(record);
+        } catch { /* the reply still goes out */ }
+      };
+      const shell = new RemoteShellProxy(core, withoutThrowInternals(transport, onThrow));
       // Log emitted Core errors (normalized code + message only — never payloads).
       // The detail is the Core's JSON-safe `SerializedError` — the same object the
       // shell forwards to the browser as the `error` update (SPEC §17).

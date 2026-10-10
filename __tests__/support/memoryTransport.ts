@@ -99,6 +99,8 @@ export interface FakeUpstreamConn {
   open: boolean;
   /** Audio payloads received (the `p` command byte stripped). */
   readonly fed: number[][];
+  /** The `s` command this connection received, once it did. */
+  start?: string;
 }
 
 /**
@@ -144,7 +146,10 @@ export function fakeUpstream(opts: { holdStop?: boolean } = {}): {
           conn.fed.push([...bytes.subarray(1)]); // strip the `p` command byte
           return;
         }
-        if (d.startsWith("s ")) queueMicrotask(() => deliver("s"));
+        if (d.startsWith("s ")) {
+          conn.start = d;
+          queueMicrotask(() => deliver("s"));
+        }
         else if (d === "e") {
           const answer = (): void => { deliver(finalFrame); deliver("e"); };
           if (opts.holdStop) heldStops.push(answer);

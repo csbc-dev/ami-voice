@@ -226,6 +226,8 @@ export interface IAmiVoiceProvider {
    * approved `s` command for a browser to open the AmiVoice WSS itself. Returns
    * the WSS endpoint + the pre-built `s` command. The permanent APPKEY never
    * leaves the provider. Optional — relay/local providers need not implement it.
+   * Both fields must be non-empty strings: the Core forwards only `endpoint` /
+   * `sCommand` to the browser and fails the mint (`invalid-param`) otherwise.
    */
   prepareDirectSession?(
     options: RecognitionOptions,

@@ -255,3 +255,252 @@ describe("direct: mint rejections keep their cause across the wire", () => {
     expect(isJsonValue(core.error)).toBe(true);
   });
 });
+
+/** A direct-mode server over the in-memory wire, its client proxy, and its log. */
+function directSetup(provider: () => IAmiVoiceProvider, logger?: (e: AmiVoiceServerLogEvent) => void) {
+  const events: AmiVoiceServerLogEvent[] = [];
+  const relay = createAmiVoiceRelayServer({
+    transport: "direct",
+    createProvider: provider,
+    logger: logger ?? ((e) => events.push(e)),
+  });
+  const pair = memoryTransportPair();
+  const ctrl = relay.handleControlConnection(pair.server);
+  const proxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, pair.client);
+  return { pair, ctrl, proxy, events };
+}
+
+/** A custom direct provider whose mint resolves / rejects as `prepare` does. */
+function customDirect(prepare: () => Promise<unknown>): () => IAmiVoiceProvider {
+  return () => ({
+    openRealtimeSession: async () => { throw new Error("direct mode must not open an upstream"); },
+    recognizeFile: async () => [],
+    prepareDirectSession: prepare as () => Promise<DirectSessionInfo>,
+  });
+}
+
+/** The server → client frames that crossed the wire, parsed. */
+function serverFrames(pair: MemoryTransportPair): Array<Record<string, unknown>> {
+  return pair.wire.filter((f) => f.startsWith("S:")).map((f) => JSON.parse(f.slice(2)));
+}
+
+async function rejectionOf(p: Promise<unknown>): Promise<Error & { code?: string; cause?: unknown }> {
+  try { await p; } catch (e) { return e as Error & { code?: string; cause?: unknown }; }
+  throw new Error("expected a rejection");
+}
+
+/**
+ * A custom `prepareDirectSession` result used to be returned as-is: an extra
+ * key holding a non-JsonValue (an `undefined` member, a `Date`) made 0.10 answer
+ * `start` with an opaque `WC_BINDABLE_INVALID_RETURN_VALUE`, an extra JSON key
+ * crossed to the browser, and a missing field went through unnoticed.
+ */
+describe("direct: a custom prepareDirectSession result is normalized before it crosses", () => {
+  const ENDPOINT = "wss://acp-api.amivoice.com/v1/";
+  const S = "s LSB16K -a-general authorization=ONE-TIME";
+
+  it("extra keys and non-JSON values are dropped: the browser gets exactly { endpoint, sCommand }", async () => {
+    const con = captureConsole();
+    const { proxy, pair } = directSetup(customDirect(async () => ({
+      endpoint: ENDPOINT, sCommand: S, expiresAt: new Date(), note: undefined, appKey: "PERMANENT-APPKEY",
+    })));
+
+    await expect(proxy.invoke("start")).resolves.toStrictEqual({ endpoint: ENDPOINT, sCommand: S });
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+    expect(pair.wire.join("\n")).not.toContain("WC_BINDABLE_INVALID_RETURN_VALUE");
+    expect(con.messages()).toEqual([]);
+  });
+
+  it("a malformed result rejects with an invalid-param error naming the field, not WC_BINDABLE_INVALID_RETURN_VALUE", async () => {
+    const { proxy } = directSetup(customDirect(async () => ({ endpoint: ENDPOINT, sCommand: new Date() })));
+
+    const err = await rejectionOf(proxy.invoke("start"));
+    expect(err.name).toBe("AmiVoiceError");
+    expect(err.code).toBe("invalid-param");
+    expect(err.message).toBe(
+      "prepareDirectSession() must resolve { endpoint, sCommand } as non-empty strings; sCommand is object",
+    );
+  });
+
+  it("the browser's in-page Core publishes that cause as its JSON-safe error", async () => {
+    const { proxy } = directSetup(customDirect(async () => ({ endpoint: ENDPOINT })));
+    const core = new AmiVoiceCore(new DirectBrowserProvider(() => proxy.invoke("start") as Promise<DirectSessionInfo>));
+
+    await expect(core.start()).resolves.toBeNull();
+    expect(core.error).toStrictEqual({
+      name: "AmiVoiceError",
+      message: "prepareDirectSession() must resolve { endpoint, sCommand } as non-empty strings; sCommand is undefined",
+      code: "invalid-param",
+    });
+  });
+});
+
+/**
+ * `@wc-bindable/remote` 0.10's shell puts `error.stack` on every `throw` it
+ * sends (wc-bindable-protocol#38), so a direct-mode mint failure delivered the
+ * SERVER's stack trace to the browser. The server helper now strips it from the
+ * wire — the thrown error and the server log keep it.
+ */
+describe("server stack traces stay on the server (wc-bindable-protocol#38)", () => {
+  /** Real provider whose `issue_service_authorization` call fails with HTTP `status`. */
+  function failingMint(status = 500): () => IAmiVoiceProvider {
+    const fetch = (async () => ({ ok: false, status, text: async () => "" })) as unknown as typeof globalThis.fetch;
+    return () => new AmiVoiceProvider({ appKey: "PERMANENT-APPKEY", fetch });
+  }
+  const MINT_FAILED = {
+    name: "AmiVoiceError",
+    message: "one-time APPKEY issuance failed (HTTP 500)",
+    code: "auth",
+  };
+
+  it("direct mint failure: the browser's error carries no server stack; name / message / code survive", async () => {
+    const con = captureConsole();
+    const { proxy, pair } = directSetup(failingMint());
+
+    const err = await rejectionOf(proxy.invoke("start"));
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toMatchObject(MINT_FAILED);
+    // The revived Error's own stack is the browser's, not the server's…
+    expect(err.stack).not.toContain("issueOneTimeAppKey");
+    // …and the envelope (kept as `cause` by RemoteCoreProxy) has none either.
+    expect(err.cause).toStrictEqual(MINT_FAILED);
+    // Nothing of the server stack crossed the wire at all.
+    expect(serverFrames(pair).find((m) => m.type === "throw")!.error).toStrictEqual(MINT_FAILED);
+    expect(pair.wire.join("\n")).not.toContain("issueOneTimeAppKey");
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+    expect(con.messages()).toEqual([]);
+  });
+
+  it("the server log keeps the original stack (redacted) with the code and message", async () => {
+    const { proxy, events } = directSetup(failingMint());
+    await rejectionOf(proxy.invoke("start"));
+
+    const logged = events.filter((e) => e.type === "error");
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ type: "error", code: "auth", message: MINT_FAILED.message });
+    expect(logged[0]).toHaveProperty("stack", expect.stringContaining("issueOneTimeAppKey"));
+    expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
+  });
+
+  it("neither the stack nor the cause chain crosses; the log keeps both", async () => {
+    // Like Node's `fetch` failing on the mint call: TypeError("fetch failed") with
+    // the socket error as its `cause` — both carrying server stacks.
+    const socketError = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    socketError.stack = "Error: connect ECONNREFUSED\n    at SERVER_CAUSE_FRAME (/srv/app/net.js:1:1)";
+    const fetchFailed = new TypeError("fetch failed");
+    fetchFailed.stack = "TypeError: fetch failed\n    at SERVER_TOP_FRAME (/srv/app/mint.js:1:1)";
+    (fetchFailed as { cause?: unknown }).cause = socketError;
+    const { proxy, pair, events } = directSetup(customDirect(async () => { throw fetchFailed; }));
+
+    const err = await rejectionOf(proxy.invoke("start"));
+
+    expect(err.name).toBe("TypeError");
+    expect(err.message).toBe("fetch failed");
+    expect(serverFrames(pair).find((m) => m.type === "throw")!.error).toStrictEqual({
+      name: "TypeError",
+      message: "fetch failed",
+    });
+    for (const marker of ["SERVER_TOP_FRAME", "SERVER_CAUSE_FRAME", "/srv/app", "ECONNREFUSED"]) {
+      expect(pair.wire.join("\n")).not.toContain(marker);
+    }
+    const logged = events.find((e) => e.type === "error") as { message: string; stack: string; cause: string };
+    expect(logged).toMatchObject({ type: "error", message: "fetch failed", stack: fetchFailed.stack });
+    expect(JSON.parse(logged.cause)).toMatchObject({ name: "Error", message: "connect ECONNREFUSED", code: "ECONNREFUSED" });
+  });
+
+  it.each([
+    ["a string", "upstream said no"],
+    ["null", null],
+    ["an array", ["a", { stack: "payload, not an error" }]],
+  ])("a non-Error cause (%s) is dropped from the wire and logged", async (_label, cause) => {
+    const thrown = new Error("mint failed");
+    (thrown as { cause?: unknown }).cause = cause;
+    const { proxy, pair, events } = directSetup(customDirect(async () => { throw thrown; }));
+
+    await rejectionOf(proxy.invoke("start"));
+    expect(serverFrames(pair).find((m) => m.type === "throw")!.error).toStrictEqual({
+      name: "Error", message: "mint failed",
+    });
+    const logged = events.find((e) => e.type === "error") as { cause: string };
+    expect(JSON.parse(logged.cause)).toStrictEqual(cause);
+  });
+
+  it("a secret inside the cause is redacted in the log", async () => {
+    const thrown = new Error("mint failed");
+    (thrown as { cause?: unknown }).cause = { detail: "authorization=PERMANENT-APPKEY rejected" };
+    const { proxy, pair, events } = directSetup(customDirect(async () => { throw thrown; }));
+
+    await rejectionOf(proxy.invoke("start"));
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+    expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
+    expect((events.find((e) => e.type === "error") as { cause: string }).cause).toContain("authorization=<redacted>");
+  });
+
+  it("an APPKEY echoed into the failure is redacted in the log record (message and stack)", async () => {
+    const { proxy, pair, events } = directSetup(customDirect(async () => {
+      throw new AmiVoiceError("-", "s LSB16K -a-general authorization=PERMANENT-APPKEY rejected");
+    }));
+    const err = await rejectionOf(proxy.invoke("start"));
+
+    expect(err.message).toBe("s LSB16K -a-general authorization=<redacted> rejected");
+    const logged = events.find((e) => e.type === "error") as { message: string; stack: string };
+    expect(logged.message).toBe("s LSB16K -a-general authorization=<redacted> rejected");
+    expect(logged.stack).toContain("authorization=<redacted>");
+    expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+  });
+
+  it("a throw the shell synthesizes itself (no stack) is logged too, without a `stack` field", async () => {
+    const { pair, events } = directSetup(failingMint());
+    // A raw frame a misbehaving / probing client could send (the proxy refuses it locally).
+    pair.client.send({ type: "cmd", name: "notACommand", id: "probe-1", args: [] });
+
+    await vi.waitFor(() => expect(events.some((e) => e.type === "error")).toBe(true));
+    expect(events.find((e) => e.type === "error")).toStrictEqual({
+      type: "error", message: "Command \"notACommand\" is not declared in wcBindable.commands",
+    });
+  });
+
+  it("a throwing logger does not keep the reply from reaching the browser", async () => {
+    const { proxy } = directSetup(failingMint(), (e) => { if (e.type === "error") throw new Error("log sink down"); });
+    const err = await rejectionOf(proxy.invoke("start"));
+    expect(err).toMatchObject(MINT_FAILED);
+  });
+
+  it("relay: any command's throw is stripped too (a custom session whose abort() throws)", async () => {
+    const thrown = new Error("session teardown failed");
+    thrown.stack = "Error: session teardown failed\n    at SERVER_ABORT_FRAME (/srv/app/session.js:1:1)";
+    const relay = createAmiVoiceRelayServer({
+      createProvider: () => ({
+        openRealtimeSession: async () => ({ feedAudio() {}, async stop() {}, abort() { throw thrown; } }),
+        recognizeFile: async () => [],
+      }),
+    });
+    const pair = memoryTransportPair();
+    relay.handleControlConnection(pair.server);
+    const { proxy } = connectClient(pair);
+    await proxy.invoke("start");
+
+    const err = await rejectionOf(proxy.invoke("abort"));
+    expect(err.message).toBe("session teardown failed");
+    expect(err.cause).toStrictEqual({ name: "Error", message: "session teardown failed" });
+    expect(pair.wire.join("\n")).not.toContain("SERVER_ABORT_FRAME");
+  });
+
+  it("in-process callers keep the full stack — the Core's own rejection is untouched", async () => {
+    const { ctrl } = directSetup(failingMint());
+    const err = await rejectionOf(ctrl.core.start()) as unknown as AmiVoiceError;
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err.stack).toContain("issueOneTimeAppKey");
+    expect(err.resultCode).toBe("-");
+    expect(err.retryable).toBe(false);
+  });
+
+  it("local mode (a Core with no server helper in front) keeps its stack", async () => {
+    const core = new AmiVoiceCore(failingMint()(), undefined, { transport: "direct" });
+    const err = await rejectionOf(core.start());
+    expect(err).toMatchObject(MINT_FAILED);
+    expect(err.stack).toContain("issueOneTimeAppKey");
+  });
+});

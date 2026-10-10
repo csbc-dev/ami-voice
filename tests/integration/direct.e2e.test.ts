@@ -4,7 +4,9 @@ import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
 import { WebSocketServerTransport, WebSocketClientTransport, createRemoteCoreProxy } from "@wc-bindable/remote";
 import { bind } from "@wc-bindable/core";
-import { createAmiVoiceRelayServer, type AmiVoiceControlSession } from "../../src/createAmiVoiceServer";
+import {
+  createAmiVoiceRelayServer, type AmiVoiceControlSession, type AmiVoiceServerLogEvent,
+} from "../../src/createAmiVoiceServer";
 import { AmiVoiceProvider } from "../../src/providers/AmiVoiceProvider";
 import { AmiVoiceCore } from "../../src/core/AmiVoiceCore";
 import { DirectBrowserProvider } from "../../src/components/realtimeSocket";
@@ -28,7 +30,10 @@ interface DirectServer {
  * upstream WSS and runs no binary audio channel. `amivoiceUrl` is what the mint
  * tells the browser to connect to directly.
  */
-async function startDirectServer(amivoiceUrl: string): Promise<DirectServer> {
+async function startDirectServer(
+  amivoiceUrl: string,
+  opts: { fetch?: typeof fetch; logger?: (e: AmiVoiceServerLogEvent) => void } = {},
+): Promise<DirectServer> {
   const relay = createAmiVoiceRelayServer({
     transport: "direct",
     createProvider: () => new AmiVoiceProvider({
@@ -36,8 +41,9 @@ async function startDirectServer(amivoiceUrl: string): Promise<DirectServer> {
       realtimeEndpoint: amivoiceUrl,
       realtimeNoLogEndpoint: amivoiceUrl,
       issueEndpoint: "https://issue.local/auth",
-      fetch: fakeIssueFetch("ONE-TIME-TOKEN"),
+      fetch: opts.fetch ?? fakeIssueFetch("ONE-TIME-TOKEN"),
     }),
+    logger: opts.logger,
   });
 
   const controlSessions = new Map<unknown, AmiVoiceControlSession>();
@@ -109,6 +115,57 @@ describe("browser-direct end-to-end (ADR 0006)", () => {
     // Exactly one upstream connection — the browser's. The server opened none.
     expect(fake.connectionCount()).toBe(1);
 
+    controlWs.close();
+  });
+
+  it("engine=\"\" / codec=\"\" from the browser: the minted `s` the browser sends uses the defaults", async () => {
+    fake = await startFakeAmiVoice();
+    server = await startDirectServer(fake.url);
+
+    const controlWs = new WebSocket(server.controlUrl);
+    const controlProxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, new WebSocketClientTransport(controlWs));
+    await controlProxy.setWithAck("engine", "");
+    await controlProxy.setWithAck("codec", "");
+
+    const core = new AmiVoiceCore(new DirectBrowserProvider(
+      () => controlProxy.invoke("start") as Promise<DirectSessionInfo>,
+      { socketFactory: wsSocketFactory },
+    ));
+    await core.start();
+    await waitFor(() => core.recognizing);
+
+    expect(fake.connections()[0].startCommand).toBe("s LSB16K -a-general authorization=ONE-TIME-TOKEN");
+    core.abort();
+    controlWs.close();
+  });
+
+  // @wc-bindable/remote 0.10 puts `error.stack` on every `throw` it sends
+  // (wc-bindable-protocol#38); the helper strips it before the wire.
+  it("a mint failure reaches the browser without the server's stack; the server log keeps it", async () => {
+    fake = await startFakeAmiVoice();
+    const events: AmiVoiceServerLogEvent[] = [];
+    const failingIssue = (async () => ({ ok: false, status: 503, text: async () => "" })) as unknown as typeof fetch;
+    server = await startDirectServer(fake.url, { fetch: failingIssue, logger: (e) => events.push(e) });
+
+    const controlWs = new WebSocket(server.controlUrl);
+    const frames: string[] = [];
+    controlWs.addEventListener("message", (e) => frames.push(String(e.data)));
+    const controlProxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, new WebSocketClientTransport(controlWs));
+
+    const err = await controlProxy.invoke("start").then(
+      () => { throw new Error("expected a rejection"); },
+      (e: unknown) => e as Error & { code?: string; cause?: unknown },
+    );
+    expect(err).toMatchObject({ name: "AmiVoiceError", message: "one-time APPKEY issuance failed (HTTP 503)", code: "auth" });
+    expect(err.stack).not.toContain("issueOneTimeAppKey");
+    expect(err.cause).not.toHaveProperty("stack");
+    expect(frames.join("\n")).not.toContain("issueOneTimeAppKey");
+    expect(frames.join("\n")).not.toContain("\"stack\"");
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error", code: "auth", stack: expect.stringContaining("issueOneTimeAppKey"),
+    }));
+    expect(fake.connectionCount()).toBe(0);
     controlWs.close();
   });
 });

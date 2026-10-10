@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { runRealtimeSession, type RealtimeSocket } from "../src/protocol/realtimeSession";
 import { AmiVoiceError } from "../src/errorCodes";
 import type { RealtimeSessionHandlers } from "../src/types";
@@ -351,5 +351,291 @@ describe("runRealtimeSession — e-ack error handling", () => {
 
     expect(h.calls.error).toHaveLength(1);
     expect((h.calls.error[0][0] as AmiVoiceError).message).toMatch(/failed to finalize/);
+  });
+});
+
+// ── a socket that throws from send() / close() after the handshake ──────────────
+
+/** Every uncaught exception / unhandled rejection of the worker while a test runs. */
+let unhandled: unknown[] = [];
+const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+
+/** Listen for uncaught exceptions / unhandled rejections around each test of the enclosing describe. */
+function captureUnhandled(): void {
+  beforeEach(() => {
+    unhandled = [];
+    process.on("uncaughtException", onUnhandled);
+    process.on("unhandledRejection", onUnhandled);
+  });
+  afterEach(() => {
+    process.off("uncaughtException", onUnhandled);
+    process.off("unhandledRejection", onUnhandled);
+  });
+}
+
+/** Settle `p` within `ms`, or reject: a stop() that never settles must fail the test, not hang it. */
+function within<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`not settled within ${ms}ms`)), ms)),
+  ]);
+}
+
+/** Like FakeSocket, but `close()` only counts: it never reports `onclose` (a custom socket's no-op close). */
+class SilentCloseSocket extends FakeSocket {
+  closeCalls = 0;
+  close(): void { this.closeCalls++; this.closed = true; }
+}
+
+/** Like FakeSocket, but `close()` throws (and so never reports `onclose`). */
+class ThrowingCloseSocket extends FakeSocket {
+  closeCalls = 0;
+  close(): void { this.closeCalls++; throw new Error("close failed"); }
+}
+
+/** Make every binary (`p`) send of `fake` throw `thrown`; text frames (`s`, `e`) still go through. */
+function throwOnAudio(fake: FakeSocket, thrown: unknown): { attempts(): number } {
+  const send = fake.send.bind(fake);
+  let attempts = 0;
+  fake.send = (d) => {
+    if (typeof d === "string") return send(d);
+    attempts++;
+    throw thrown;
+  };
+  return { attempts: () => attempts };
+}
+
+/**
+ * A `p` frame whose `send` throws. `feedAudio` runs from the audio channel's
+ * message listener (relay: the server's `ws` dispatch) or the mic's frame
+ * callback (local / direct), so a throw left there reached the platform's
+ * uncaught-exception reporting — in relay, the server process — and the session
+ * stayed `recognizing` with its upstream socket open. It fails the session
+ * once instead: the thrown value, as is, through `onError` (the Core shapes and
+ * redacts it with `toError`), the session's end through `onClose`, and the
+ * socket closed quietly (SPEC §17).
+ */
+describe("runRealtimeSession — an audio-frame send that throws", () => {
+  captureUnhandled();
+
+  it("reports the thrown value once (onError), ends the session (onClose), closes the socket; later frames are dropped", async () => {
+    const fake = new FakeSocket(); // close() reports onclose synchronously
+    const h = handlers();
+    const session = await startSession(fake, h);
+    const thrown = new Error("send failed");
+    const audio = throwOnAudio(fake, thrown);
+
+    expect(() => session.feedAudio(new Uint8Array([1, 2, 3]))).not.toThrow();
+    session.feedAudio(new Uint8Array([4]));
+    session.feedAudio(new Uint8Array([5]));
+
+    expect(audio.attempts()).toBe(1);          // nothing more is sent on the failed socket
+    expect(h.calls.error).toEqual([[thrown]]); // the value as is — and no "connection lost" for the close it caused
+    expect(h.calls.close).toHaveLength(1);
+    expect(fake.closed).toBe(true);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("passes a non-Error value on as it is", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    throwOnAudio(fake, "send failed");
+
+    session.feedAudio(new Uint8Array([1]));
+
+    expect(h.calls.error).toEqual([["send failed"]]);
+    expect(h.calls.close).toHaveLength(1);
+  });
+
+  it("ends the session even when the socket's close never reports, and ignores a close reported later", async () => {
+    const fake = new SilentCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    throwOnAudio(fake, new Error("send failed"));
+
+    session.feedAudio(new Uint8Array([1]));
+
+    expect(h.calls.close).toHaveLength(1); // the Core tears down without waiting for a close that never comes
+    expect(fake.closeCalls).toBe(1);
+
+    fake.onclose?.(); // a platform socket reports its close later
+    expect(h.calls.close).toHaveLength(1);
+    expect(h.calls.error).toHaveLength(1);
+  });
+
+  it("whatever the socket still delivers afterwards — results, a non-ok ack, an error — is not reported", async () => {
+    const fake = new SilentCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    throwOnAudio(fake, new Error("send failed"));
+    session.feedAudio(new Uint8Array([1]));
+
+    fake.recv('U {"text":"こん","results":[{"tokens":[]}]}');
+    fake.recv('A {"text":"こんにちは","results":[{"text":"こんにちは","confidence":0.9,"tokens":[]}]}');
+    fake.recv("p frame rejected");
+    fake.onerror?.(new Error("socket error"));
+
+    expect(h.calls.interim).toBeUndefined();
+    expect(h.calls.final).toBeUndefined();
+    expect(h.calls.error).toHaveLength(1); // the send's, only
+    expect(h.calls.close).toHaveLength(1);
+  });
+
+  it("a close() that throws stays inside", async () => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    const thrown = new Error("send failed");
+    throwOnAudio(fake, thrown);
+
+    expect(() => session.feedAudio(new Uint8Array([1]))).not.toThrow();
+
+    expect(fake.closeCalls).toBe(1);
+    expect(h.calls.error).toEqual([[thrown]]);
+    expect(h.calls.close).toHaveLength(1);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("stop() and abort() afterwards are safe: stop() settles at once without sending `e`, abort() closes nothing more", async () => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+    throwOnAudio(fake, new Error("send failed"));
+    session.feedAudio(new Uint8Array([1]));
+
+    await expect(within(session.stop(), 1000)).resolves.toBeUndefined();
+    expect(() => session.abort()).not.toThrow();
+
+    expect(fake.sent).not.toContain("e");
+    expect(fake.closeCalls).toBe(1);
+    expect(h.calls.error).toHaveLength(1);
+    expect(h.calls.close).toHaveLength(1);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("during a graceful stop: the error is reported once and the stop settles at once", async () => {
+    const fake = new SilentCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+    const stopped = session.stop();
+    expect(fake.sent).toContain("e");
+    const thrown = new Error("send failed");
+    throwOnAudio(fake, thrown);
+
+    session.feedAudio(new Uint8Array([1])); // a frame still in flight behind the stop
+
+    await expect(within(stopped, 1000)).resolves.toBeUndefined(); // not after the 60 s fallback
+    expect(h.calls.error).toEqual([[thrown]]);
+    expect(h.calls.close).toHaveLength(1);
+  });
+
+  it.each(["abort", "stop"] as const)("a frame after %s() is not sent, and reports nothing", async (end) => {
+    const fake = new SilentCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h);
+    if (end === "abort") session.abort();
+    else { const stopped = session.stop(); fake.recv("e"); await stopped; }
+    const audio = throwOnAudio(fake, new Error("send on a closed socket"));
+
+    session.feedAudio(new Uint8Array([1]));
+
+    expect(audio.attempts()).toBe(0);
+    expect(h.calls.error).toBeUndefined(); // a session we left reports no failure (SPEC §10.1, §18)
+  });
+});
+
+/**
+ * `finish()` closes the socket when a graceful stop settles — on the `e` ack,
+ * on the socket's close, or on the fallback timer. A `close()` that threw there
+ * escaped from that event (or timer) as an uncaught exception, and since `done`
+ * was already set and the timer cleared, the stop never resolved: the Core
+ * stayed `recognizing` and refused every later start (SPEC §18).
+ */
+describe("runRealtimeSession — a graceful stop whose socket.close() throws", () => {
+  captureUnhandled();
+
+  it.each([
+    ["the `e` ack", (fake: FakeSocket) => fake.recv("e")],
+    ["the socket's close", (fake: FakeSocket) => fake.onclose?.()],
+  ])("settles on %s; the throw stays inside", async (_label, answer) => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 60_000);
+
+    const stopped = session.stop();
+    expect(() => answer(fake)).not.toThrow();
+
+    await expect(within(stopped, 1000)).resolves.toBeUndefined();
+    expect(fake.closeCalls).toBe(1);
+    expect(h.calls.error).toBeUndefined();
+    expect(unhandled).toEqual([]);
+  });
+
+  it("settles on the fallback timer; the throw stays inside", async () => {
+    const fake = new ThrowingCloseSocket();
+    const h = handlers();
+    const session = await startSession(fake, h, /* stopTimeoutMs */ 5);
+
+    await expect(within(session.stop(), 1000)).resolves.toBeUndefined();
+
+    expect(fake.closeCalls).toBe(1);
+    expect(h.calls.error).toBeUndefined();
+    expect(unhandled).toEqual([]);
+  });
+});
+
+/**
+ * `onopen` sends the `s` command, which carries the APPKEY. A socket can report
+ * `open` after the handshake already settled — a connect deadline that fired
+ * while it was still connecting, an error, a close — when its `close()` did not
+ * take (a custom socket's no-op close). The loop had abandoned that socket, yet
+ * sent it the credential. It sends nothing now, and closes the socket again.
+ */
+describe("runRealtimeSession — an onopen after the handshake settled", () => {
+  captureUnhandled();
+
+  it.each([
+    ["the connect deadline", (_fake: FakeSocket): void => { /* the 5 ms deadline fires */ }],
+    ["a socket error", (fake: FakeSocket): void => { fake.onerror?.(new Error("boom")); }],
+    ["the socket's close", (fake: FakeSocket): void => { fake.onclose?.(); }],
+  ])("after %s: sends no `s` command (no APPKEY) and closes the socket again", async (_label, settle) => {
+    const fake = new SilentCloseSocket();
+    const h = handlers();
+    const p = runRealtimeSession(fake, START, h, 5000, /* connectTimeoutMs */ 5);
+    settle(fake);
+    await expect(p).rejects.toBeDefined();
+    const closesBefore = fake.closeCalls;
+
+    expect(() => fake.open()).not.toThrow(); // the late open
+    fake.recv("s");                          // and whatever the upstream answers
+
+    expect(fake.sent).toEqual([]);
+    expect(fake.closeCalls).toBe(closesBefore + 1);
+    expect(h.calls.error).toBeUndefined();
+    expect(h.calls.close).toBeUndefined();
+    expect(unhandled).toEqual([]);
+  });
+
+  it("a close() that throws on the late open stays inside", async () => {
+    const fake = new ThrowingCloseSocket();
+    const p = runRealtimeSession(fake, START, handlers(), 5000, /* connectTimeoutMs */ 5);
+    await expect(p).rejects.toThrow(/within 5ms/);
+
+    expect(() => fake.open()).not.toThrow();
+    expect(fake.sent).toEqual([]);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("a second open on a live session neither re-sends `s` nor closes it", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    await startSession(fake, h);
+
+    fake.open();
+
+    expect(fake.sent).toEqual([START]);
+    expect(fake.closed).toBe(false);
+    expect(h.calls.close).toBeUndefined();
   });
 });

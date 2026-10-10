@@ -92,6 +92,8 @@ For this package, the following count as breaking once implementation exists:
 - Changes to the codec / audio-format contract the Shell streams to the Core.
 - Changes to the remote wire protocol or the normalized error contract.
 
+> **While the package is in `0.x.y`, map a breaking change to minor and a feature addition or fix to patch.** This is the convention of the upstream `@wc-bindable/*` line and of `@csbc-dev/ai-agent`. Upstream still ships breaking changes as 0.x minors, so a 1.0 here would not be a stable promise. Bump major only once the package is at 1.0 or later.
+
 Prefer editing the `version` field directly in `package.json` rather than running `npm version`, unless the user explicitly wants the automatic commit-and-tag behavior.
 
 ---

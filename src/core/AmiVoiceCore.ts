@@ -12,8 +12,48 @@ import { toSpeakerSegment } from "../speakerView.js";
 import { normalizeSegment } from "../protocol/wnnProtocol.js";
 import { DEFAULT_CODEC } from "../audio/pcmEncoder.js";
 
-/** Default `engine` (`grammar_file_names`) — what a `null` / `undefined` write restores (SPEC §7.2). */
+/** Default `engine` (`grammar_file_names`) — what a `null` / `undefined` / `""` write restores (SPEC §7.2). */
 const DEFAULT_ENGINE: AmiVoiceEngine = "-a-general";
+
+/**
+ * Resolve an `engine` / `codec` write: `null` / `undefined` / `""` → `fallback`
+ * (SPEC §7.2). The two are the positional `<audio_format> <grammar_file_names>`
+ * tokens of the `s` command, where an empty string is never a valid value — a
+ * stored `""` built `s  -a-general …` / `s LSB16K  authorization=…`. (`""` is
+ * what `<ami-voice engine="">` forwards.) Inputs whose default already is `""`
+ * need no such mapping.
+ */
+function orDefault<T extends string>(v: T | null | undefined, fallback: T): T {
+  return v == null || v === "" ? fallback : v;
+}
+
+/**
+ * Shape a provider's `prepareDirectSession` result (direct mode) into exactly
+ * the `DirectSessionInfo` that `start()` returns — the `return` the remote shell
+ * sends to the browser, validated by `@wc-bindable/remote` ≥ 0.10 as a strict
+ * `JsonValue`. A custom provider's extra keys (an `undefined` member, a `Date`,
+ * …) used to fail that check as an opaque `WC_BINDABLE_INVALID_RETURN_VALUE`;
+ * they are dropped here instead, so no stray field reaches the browser either.
+ * A missing / non-string / empty `endpoint` or `sCommand` cannot be repaired: it
+ * is rejected with an error naming the field and its type — never its value,
+ * since `sCommand` carries the one-time APPKEY.
+ */
+function toDirectSessionInfo(raw: unknown): DirectSessionInfo {
+  const typeOf = (v: unknown): string => (v === null ? "null" : Array.isArray(v) ? "an array" : typeof v);
+  const contract = "prepareDirectSession() must resolve { endpoint, sCommand } as non-empty strings";
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new AmiVoiceError("^", `${contract}; got ${typeOf(raw)}`);
+  }
+  const info = raw as Record<string, unknown>;
+  const problems: string[] = [];
+  for (const key of ["endpoint", "sCommand"] as const) {
+    const v = info[key];
+    if (typeof v !== "string") problems.push(`${key} is ${typeOf(v)}`);
+    else if (v === "") problems.push(`${key} is empty`);
+  }
+  if (problems.length > 0) throw new AmiVoiceError("^", `${contract}; ${problems.join(", ")}`);
+  return { endpoint: info.endpoint as string, sCommand: info.sCommand as string };
+}
 
 /** Observable outputs Core publishes, paired with `ami-voice:<name>-changed`. */
 const CORE_PROPERTY_NAMES = [
@@ -172,11 +212,12 @@ export class AmiVoiceCore extends EventTarget {
   // remote wire (it is not a JsonValue), so a remote client — e.g. the Shell
   // forwarding React 19's `undefined` on a removed prop — sends `null`. Without
   // the reset, `engine`/`codec` would be stored as-is and `buildStartCommand`
-  // would emit `s null null …` / `s LSB16K undefined …`.
+  // would emit `s null null …` / `s LSB16K undefined …`. `engine` / `codec`
+  // also reset on `""` (see `orDefault`); the other inputs store it as given.
   get engine(): AmiVoiceEngine { return this._engine; }
-  set engine(v: AmiVoiceEngine | null | undefined) { this._engine = v ?? DEFAULT_ENGINE; }
+  set engine(v: AmiVoiceEngine | null | undefined) { this._engine = orDefault(v, DEFAULT_ENGINE); }
   get codec(): AmiVoiceCodec { return this._codec; }
-  set codec(v: AmiVoiceCodec | null | undefined) { this._codec = v ?? DEFAULT_CODEC; }
+  set codec(v: AmiVoiceCodec | null | undefined) { this._codec = orDefault(v, DEFAULT_CODEC); }
   get profileId(): string { return this._profileId; }
   set profileId(v: string | null | undefined) { this._profileId = v ?? ""; }
   get profileWords(): string { return this._profileWords; }
@@ -307,7 +348,9 @@ export class AmiVoiceCore extends EventTarget {
    *
    * Direct (docs/adr/0006): the Core opens NO upstream — it mints a one-time
    * APPKEY + approved `s` command and returns them as `DirectSessionInfo` for the
-   * browser to open the WSS itself. Mint failures REJECT here (rather than
+   * browser to open the WSS itself (exactly `{ endpoint, sCommand }` — a
+   * provider's result is re-shaped by `toDirectSessionInfo`, and a malformed one
+   * is a mint failure). Mint failures REJECT here (rather than
    * publishing to this server-side Core's `error`, which the browser does not
    * bind) so the failure surfaces over `invoke("start")` to the browser's
    * in-page Core, which then publishes it to the bound `error`. The rejection is
@@ -329,7 +372,9 @@ export class AmiVoiceCore extends EventTarget {
         if (!this._provider.prepareDirectSession) {
           throw new AmiVoiceError("^", "provider does not support direct mode (no prepareDirectSession)");
         }
-        return await this._provider.prepareDirectSession(this._currentOptions(), this._mintOptions?.());
+        return toDirectSessionInfo(
+          await this._provider.prepareDirectSession(this._currentOptions(), this._mintOptions?.()),
+        );
       }
       const session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers(generation));
       if (generation !== this._sessionGeneration) {

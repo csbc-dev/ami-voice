@@ -527,6 +527,46 @@ describe("AmiVoiceCore input reset (null / undefined)", () => {
     const s = buildStartCommand(seen!, "KEY");
     expect(s).toBe("s LSB16K -a-general authorization=KEY");
   });
+
+  // `<ami-voice engine="">` / `el.engine = ""` forward "". engine/codec are the
+  // positional tokens of `s`, so a stored "" built `s  -a-general …` (codec) or
+  // `s LSB16K  authorization=…` (engine).
+  it("an empty-string engine / codec resets to the default, also after a real value", () => {
+    const core = new AmiVoiceCore(fakeProvider().provider);
+    core.engine = "-a-medical";
+    core.codec = "MSB16K";
+    core.engine = "";
+    core.codec = "";
+    expect(core.engine).toBe("-a-general");
+    expect(core.codec).toBe("LSB16K");
+  });
+
+  it("an empty-string engine / codec builds a valid `s` command", async () => {
+    let seen: RecognitionOptions | undefined;
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: async (options) => {
+        seen = options;
+        return { feedAudio() {}, async stop() {}, abort() {} };
+      },
+      recognizeFile: async () => [],
+    };
+    const core = new AmiVoiceCore(provider);
+    core.engine = "";
+    core.codec = "";
+    await core.start();
+
+    expect(seen).toMatchObject({ engine: "-a-general", codec: "LSB16K" });
+    expect(buildStartCommand(seen!, "KEY")).toBe("s LSB16K -a-general authorization=KEY");
+  });
+
+  it("the other inputs keep \"\" as given (for the string ones it already is the default)", () => {
+    const core = new AmiVoiceCore(fakeProvider().provider) as AmiVoiceCore & Record<string, unknown>;
+    for (const name of ["profileId", "profileWords", "segmenterProperties"]) {
+      core[name] = "x";
+      core[name] = "";
+      expect(core[name], name).toBe("");
+    }
+  });
 });
 
 /**

@@ -23,6 +23,8 @@ export interface FakeAmiVoiceConnection {
   open: boolean;
   /** Binary `p` audio frames received. */
   audioFrames: number;
+  /** The `s` command this connection received, once it did. */
+  startCommand?: string;
 }
 
 export interface FakeAmiVoiceHandle {
@@ -60,6 +62,7 @@ export function startFakeAmiVoice(opts: FakeAmiVoiceOptions = {}): Promise<FakeA
       const text = data.toString();
       switch (text[0]) {
         case "s":
+          conn.startCommand = text;
           sock.send(opts.rejectStart ? `s ${opts.rejectStart}` : "s");
           break;
         case "e":

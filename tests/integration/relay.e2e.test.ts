@@ -201,6 +201,21 @@ describe("relay end-to-end (control + binary audio)", () => {
     expect(el.error).toBeNull();
   });
 
+  it("engine=\"\" / codec=\"\" from the client: the server's `s` command uses the defaults", async () => {
+    fake = await startFakeAmiVoice();
+    server = await startRelayServer(fake.url);
+
+    const controlWs = new WebSocket(server.controlUrl);
+    const proxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, new WebSocketClientTransport(controlWs));
+    await proxy.setWithAck("engine", "");
+    await proxy.setWithAck("codec", "");
+
+    expect(typeof await proxy.invoke("start")).toBe("string");
+    expect(fake.connections()[0].startCommand).toBe("s LSB16K -a-general authorization=TEST");
+    await proxy.invoke("abort");
+    controlWs.close();
+  });
+
   it("rejects an audio connection bearing an unknown session token", async () => {
     fake = await startFakeAmiVoice();
     server = await startRelayServer(fake.url);

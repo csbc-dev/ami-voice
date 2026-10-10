@@ -80,9 +80,9 @@ Because the `@wc-bindable/remote` control wire is JSON-only, audio cannot ride i
 
 This package targets `@wc-bindable/core` / `@wc-bindable/remote` `^0.10.0`. Since 0.10 the control channel validates every value as a `JsonValue` in **both** directions: `undefined`, `NaN` / `±Infinity`, `Date`, `Map`, class instances (`Error` included) and objects with an `undefined` member are **rejected, not coerced**. What that means here:
 
-- **Inputs.** Assigning `undefined` or `null` to an input — `el.engine = undefined` is what React 19 does when you remove a prop — **resets it to its default** (`engine` → `-a-general`, `codec` → `LSB16K`, strings → `""`, booleans → `false`, `resultUpdatedInterval` → `0`); the element forwards it as `null`, and treats `NaN` the same way. Any other non-JSON value (a `Date`, a reactive proxy, …) fails the write with an `ami-voice:error` whose `code` is `WC_BINDABLE_INVALID_JSON_VALUE` — convert it first (Vue `toRaw()`, MobX `toJS()`, `structuredClone`).
+- **Inputs.** Assigning `undefined` or `null` to an input — `el.engine = undefined` is what React 19 does when you remove a prop — **resets it to its default** (`engine` → `-a-general`, `codec` → `LSB16K`, strings → `""`, booleans → `false`, `resultUpdatedInterval` → `0`); the element forwards it as `null`, and treats `NaN` the same way. An empty string resets `engine` and `codec` too (`engine=""`, `el.codec = ""`) — neither has a valid empty value. Any other non-JSON value (a `Date`, a reactive proxy, …) fails the write with an `ami-voice:error` whose `code` is `WC_BINDABLE_INVALID_JSON_VALUE` — convert it first (Vue `toRaw()`, MobX `toJS()`, `structuredClone`).
 - **`error`.** The Core publishes errors as a plain object `{ name, message, code?, resultCode?, retryable? }` — the same shape locally and in relay/direct mode — so a relay client now sees start failures and upstream drops (e.g. `code: "auth"`, `"upstream"`), and `getErrorCode(el.error)` works everywhere. Errors the element raises itself (codec rejection, microphone denied, a failed control call) are `Error` instances: read `name` / `message` / `code`, don't rely on `instanceof`.
-- **Custom providers.** Finalized segments from a custom `IAmiVoiceProvider` are re-normalized by the Core to the public `RecognitionSegment` shape (unknown keys dropped, `NaN` → `0`, `undefined` members omitted). A custom `prepareDirectSession` must return plain `{ endpoint, sCommand }` strings.
+- **Custom providers.** Finalized segments from a custom `IAmiVoiceProvider` are re-normalized by the Core to the public `RecognitionSegment` shape (unknown keys dropped, `NaN` → `0`, `undefined` members omitted). A custom `prepareDirectSession` must resolve `{ endpoint, sCommand }` as non-empty strings. The Core forwards exactly those two fields to the browser (any other key is dropped — a `Date` or an `undefined` member no longer fails the reply as `WC_BINDABLE_INVALID_RETURN_VALUE`); if either is missing, not a string, or empty, `start` fails with an `invalid-param` error naming the field and its type.
 - **Upgrade server and browser together.** The producer side decides what crosses the wire; run the same `@csbc-dev/ami-voice` release on the server and in the bundle.
 
 ## Browser-direct mode (opt-in)
@@ -128,7 +128,9 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each as 
 
 ### Structured logging
 
-`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and emitted Core errors. Records never contain the APPKEY, the audio token, or wire payloads.
+`createAmiVoiceRelayServer({ logger })` takes an optional structured logger — connection open/close, rejected audio frames, and errors: those the Core publishes, and those sent to the browser as a failed call (e.g. a direct-mode mint failure). Records never contain the APPKEY, the audio token, or wire payloads.
+
+Server internals stay on the server: the browser gets a failed call's `name` / `message` / `code` without the `stack` or the `cause` chain, and the `error` record carries both (redacted) instead.
 
 ```js
 createAmiVoiceRelayServer({
@@ -136,6 +138,7 @@ createAmiVoiceRelayServer({
   // e.g. { type: "control-open", transport: "relay", peerAddress }
   //      { type: "audio-rejected", reason: "unknown-session" }
   //      { type: "error", code: "upstream", message }
+  //      { type: "error", code: "auth", message, stack, cause }   // a failed call (stack / cause withheld from the browser)
 });
 ```
 

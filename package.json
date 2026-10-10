@@ -52,8 +52,8 @@
     "declarative"
   ],
   "dependencies": {
-    "@wc-bindable/core": "^0.8.0",
-    "@wc-bindable/remote": "^0.8.0"
+    "@wc-bindable/core": "^0.10.0",
+    "@wc-bindable/remote": "^0.10.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.0",

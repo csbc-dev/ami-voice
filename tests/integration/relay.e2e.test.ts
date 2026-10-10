@@ -9,6 +9,7 @@ import { bind } from "@wc-bindable/core";
 import { createAmiVoiceRelayServer, type AmiVoiceControlSession } from "../../src/createAmiVoiceServer";
 import { AmiVoiceProvider } from "../../src/providers/AmiVoiceProvider";
 import { AmiVoiceCore } from "../../src/core/AmiVoiceCore";
+import { getErrorCode } from "../../src/errorCodes";
 import { startFakeAmiVoice, type FakeAmiVoiceHandle } from "../support/fakeAmiVoice";
 import { wsSocketFactory } from "../support/wsSocketFactory";
 
@@ -109,6 +110,54 @@ describe("relay end-to-end (control + binary audio)", () => {
     expect((values.segments as unknown[]).length).toBe(1);
 
     audioWs.close();
+    controlWs.close();
+  });
+
+  // @wc-bindable/remote >= 0.10 drops a non-JsonValue property value, so an
+  // `AmiVoiceError` instance on the Core's `error` never reached the client.
+  // These pin the failure paths over real sockets (SPEC §10.1, §17).
+  it("a rejected start publishes the (redacted) cause to the client's `error`", async () => {
+    fake = await startFakeAmiVoice({ rejectStart: "authorization=TEST rejected" });
+    server = await startRelayServer(fake.url);
+
+    const controlWs = new WebSocket(server.controlUrl);
+    const proxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, new WebSocketClientTransport(controlWs));
+    const values: Record<string, unknown> = {};
+    unbind = bind(proxy, (name, value) => { values[name] = value; });
+
+    await expect(proxy.invoke("start")).resolves.toBeNull(); // SPEC §17: publish, don't reject
+    expect(values.error).toStrictEqual({
+      name: "AmiVoiceError",
+      message: "authorization=<redacted> rejected",
+      code: "unknown",
+      resultCode: "",
+      retryable: true,
+    });
+    expect(getErrorCode(values.error)).toBe("unknown");
+    expect(values.recognizing).toBe(false);
+    expect(values.loading).toBe(false);
+    controlWs.close();
+  });
+
+  it("an upstream drop mid-session reaches the client as `error`=upstream + connected=false (§10.1)", async () => {
+    fake = await startFakeAmiVoice();
+    server = await startRelayServer(fake.url);
+
+    const controlWs = new WebSocket(server.controlUrl);
+    const proxy = createRemoteCoreProxy(AmiVoiceCore.wcBindable, new WebSocketClientTransport(controlWs));
+    const values: Record<string, unknown> = {};
+    unbind = bind(proxy, (name, value) => { values[name] = value; });
+
+    expect(typeof await proxy.invoke("start")).toBe("string");
+    await waitFor(() => values.connected === true);
+
+    fake.dropAll();
+
+    await waitFor(() => values.error != null);
+    expect(getErrorCode(values.error)).toBe("upstream");
+    expect(values.error).toMatchObject({ name: "AmiVoiceError", message: "AmiVoice connection lost mid-session" });
+    expect(values.connected).toBe(false);
+    expect(values.recognizing).toBe(false);
     controlWs.close();
   });
 

@@ -58,7 +58,7 @@ If any check fails, stop and report. Do not attempt fixes unless the user asks.
 
 ## Local-path dependency check (MANDATORY before publish)
 
-Once `package.json` exists, it is expected to pin `@wc-bindable/core` and `@wc-bindable/remote` to semver ranges on the **current `@wc-bindable/*` lockstep line — `^0.8.0`** (the whole upstream family, including `composite`, releases at one lockstep version; confirm the latest in the sibling repo's `RELEASE_NOTES.md` before cutting a release and bump both ranges together). It is common during development to temporarily swap one of these for a sibling-monorepo `file:` reference (e.g. `file:../../wc-bindable-protocol/wc-bindable-protocol/packages/core`). **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI**, and downstream `npm install @csbc-dev/ami-voice` on any machine without that exact directory layout would fail.
+Once `package.json` exists, it is expected to pin `@wc-bindable/core` and `@wc-bindable/remote` to semver ranges on the **current `@wc-bindable/*` lockstep line — `^0.10.0`** (the whole upstream family, including `composite`, releases at one lockstep version; confirm the latest in the sibling repo's `RELEASE_NOTES.md` before cutting a release and bump both ranges together). It is common during development to temporarily swap one of these for a sibling-monorepo `file:` reference (e.g. `file:../../wc-bindable-protocol/wc-bindable-protocol/packages/core`). **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI**, and downstream `npm install @csbc-dev/ami-voice` on any machine without that exact directory layout would fail.
 
 Before any release-prep step, inspect `package.json` `dependencies` for values starting with:
 

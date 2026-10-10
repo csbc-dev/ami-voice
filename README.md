@@ -61,7 +61,7 @@ Any framework adapter from the `@wc-bindable/*` family (React, Vue, Svelte, …)
 | `speakers` | speaker-labeled finalized turns (derived from `segments`; group by `label` for a per-speaker transcript — needs `segmenterProperties="useDiarizer=1"`) |
 | `confidence` | latest finalized-segment confidence (final-only) |
 | `level` | mic input level (for a meter) |
-| `loading` / `error` | request in flight / last error |
+| `loading` / `error` | request in flight / last error — a plain `{ name, message, code?, resultCode?, retryable? }` object; read the normalized code with `getErrorCode(error)` |
 
 **Inputs**: `engine`, `codec`, `profileId`, `profileWords`, `keepFillerToken`, `resultUpdatedInterval`, `segmenterProperties`, `noLog`.
 **Commands**: `start()`, `stop()` (graceful), `abort()` (immediate), `reset()`.
@@ -73,6 +73,15 @@ Full contract: [SPEC.md §7](SPEC.md).
 ## How it works (and what it costs)
 
 Because the `@wc-bindable/remote` control wire is JSON-only, audio cannot ride it. The relay is **two channels**: a JSON control channel (state + commands) and a **separate binary WebSocket** for PCM frames, correlated by a session token. Audio therefore traverses your server, so **server cost scales with audio volume**, not just connection count.
+
+### Control-channel values are strict JSON (`@wc-bindable/remote` ≥ 0.10)
+
+This package targets `@wc-bindable/core` / `@wc-bindable/remote` `^0.10.0`. Since 0.10 the control channel validates every value as a `JsonValue` in **both** directions: `undefined`, `NaN` / `±Infinity`, `Date`, `Map`, class instances (`Error` included) and objects with an `undefined` member are **rejected, not coerced**. What that means here:
+
+- **Inputs.** Assigning `undefined` or `null` to an input — `el.engine = undefined` is what React 19 does when you remove a prop — **resets it to its default** (`engine` → `-a-general`, `codec` → `LSB16K`, strings → `""`, booleans → `false`, `resultUpdatedInterval` → `0`); the element forwards it as `null`, and treats `NaN` the same way. Any other non-JSON value (a `Date`, a reactive proxy, …) fails the write with an `ami-voice:error` whose `code` is `WC_BINDABLE_INVALID_JSON_VALUE` — convert it first (Vue `toRaw()`, MobX `toJS()`, `structuredClone`).
+- **`error`.** The Core publishes errors as a plain object `{ name, message, code?, resultCode?, retryable? }` — the same shape locally and in relay/direct mode — so a relay client now sees start failures and upstream drops (e.g. `code: "auth"`, `"upstream"`), and `getErrorCode(el.error)` works everywhere. Errors the element raises itself (codec rejection, microphone denied, a failed control call) are `Error` instances: read `name` / `message` / `code`, don't rely on `instanceof`.
+- **Custom providers.** Finalized segments from a custom `IAmiVoiceProvider` are re-normalized by the Core to the public `RecognitionSegment` shape (unknown keys dropped, `NaN` → `0`, `undefined` members omitted). A custom `prepareDirectSession` must return plain `{ endpoint, sCommand }` strings.
+- **Upgrade server and browser together.** The producer side decides what crosses the wire; run the same `@csbc-dev/ami-voice` release on the server and in the bundle.
 
 ## Browser-direct mode (opt-in)
 

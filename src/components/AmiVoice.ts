@@ -169,22 +169,25 @@ export class AmiVoice extends HTMLElement {
   get mode(): "local" | "remote" { return this._mode; }
 
   // ── inputs (forwarded to the active bind target) ─────────────────────────────
+  // Setters accept `null` / `undefined` (React 19 assigns `undefined` when a
+  // prop is removed): both reset the input to its Core default — see
+  // `_writeInput` and SPEC §7.2.
   get engine(): string { return String(this._inputCache.engine ?? ""); }
-  set engine(v: string) { this._writeInput("engine", v); }
+  set engine(v: string | null | undefined) { this._writeInput("engine", v); }
   get codec(): string { return String(this._inputCache.codec ?? ""); }
-  set codec(v: string) { this._writeInput("codec", v); }
+  set codec(v: string | null | undefined) { this._writeInput("codec", v); }
   get profileId(): string { return String(this._inputCache.profileId ?? ""); }
-  set profileId(v: string) { this._writeInput("profileId", v); }
+  set profileId(v: string | null | undefined) { this._writeInput("profileId", v); }
   get profileWords(): string { return String(this._inputCache.profileWords ?? ""); }
-  set profileWords(v: string) { this._writeInput("profileWords", v); }
+  set profileWords(v: string | null | undefined) { this._writeInput("profileWords", v); }
   get keepFillerToken(): boolean { return Boolean(this._inputCache.keepFillerToken); }
-  set keepFillerToken(v: boolean) { this._writeInput("keepFillerToken", v); }
+  set keepFillerToken(v: boolean | null | undefined) { this._writeInput("keepFillerToken", v); }
   get resultUpdatedInterval(): number { return Number(this._inputCache.resultUpdatedInterval ?? 0); }
-  set resultUpdatedInterval(v: number) { this._writeInput("resultUpdatedInterval", v); }
+  set resultUpdatedInterval(v: number | null | undefined) { this._writeInput("resultUpdatedInterval", v); }
   get segmenterProperties(): string { return String(this._inputCache.segmenterProperties ?? ""); }
-  set segmenterProperties(v: string) { this._writeInput("segmenterProperties", v); }
+  set segmenterProperties(v: string | null | undefined) { this._writeInput("segmenterProperties", v); }
   get noLog(): boolean { return Boolean(this._inputCache.noLog); }
-  set noLog(v: boolean) { this._writeInput("noLog", v); }
+  set noLog(v: boolean | null | undefined) { this._writeInput("noLog", v); }
 
   // ── commands (the element surface) ───────────────────────────────────────────
   // An in-page Core (`_core`) drives local AND direct (direct mints via the
@@ -299,15 +302,27 @@ export class AmiVoice extends HTMLElement {
   }
 
   private _writeInput(name: string, value: unknown): void {
-    this._inputCache[name] = value;
+    // "No value" — `undefined` (React 19 assigns it when a prop is removed),
+    // `null`, or a non-finite number such as `NaN` — is forwarded as `null`,
+    // which the Core treats as reset-to-default (SPEC §7.2; wc-bindable
+    // SPEC-extensions § Producer guidance P1/P2). `undefined` / `NaN` are not
+    // JsonValues: remote ≥ 0.10 `setWithAck` would reject them before sending
+    // (`WC_BINDABLE_INVALID_JSON_VALUE`), and the in-page Core would build an
+    // `s` command containing `undefined`. The reset is dropped from the cache so
+    // a later (re)connect does not replay it — a fresh Core already holds the
+    // default.
+    const unset = value == null || (typeof value === "number" && !Number.isFinite(value));
+    const wire = unset ? null : value;
+    if (unset) delete this._inputCache[name];
+    else this._inputCache[name] = wire;
     // Forward to the server (relay + direct: the server builds the approved `s`)
     // and to the in-page Core (local + direct: keeps it consistent). Direct does
     // both; relay only the proxy; local only the Core.
     if (this._proxy) {
-      void this._proxy.setWithAck(name, value).catch((e) => this._setError(normaliseError(e)));
+      void this._proxy.setWithAck(name, wire).catch((e) => this._setError(normaliseError(e)));
     }
     if (this._core) {
-      (this._core as unknown as Record<string, unknown>)[name] = value;
+      (this._core as unknown as Record<string, unknown>)[name] = wire;
     }
   }
 
@@ -389,19 +404,34 @@ export class AmiVoice extends HTMLElement {
 
   private async _startMicRemote(session: unknown): Promise<void> {
     const sessionId = typeof session === "string" ? session : String(session ?? "");
-    // An empty id means the server-side Core refused to (re-)start — e.g. a
-    // re-entrant start() while a session is already live (its guard returns
-    // null). The server deliberately treated this as a no-op to PROTECT the live
-    // session, so we must NOT throw here: a throw would propagate to start()'s
-    // catch → `_rollbackStart()` → `invoke("abort")` and tear down the very
-    // session the server kept alive (latent edge b). Surface a benign,
-    // non-destructive notice and leave the existing session untouched. We also
-    // do not open an audio channel with an empty token (it would route nowhere).
+    // An empty id means the server-side Core opened no session. Two causes:
+    //  - the start FAILED (auth, upstream, …). The Core published the real
+    //    cause to `error` and settled `recognizing=false` / `loading=false`
+    //    BEFORE resolving (SPEC §17), and the control channel is ordered, so
+    //    the bound `_values` already hold them. Do NOT overwrite that cause.
+    //  - a re-entrant start() while a session is live / still handshaking
+    //    (the Core's guard returns null, `recognizing` or `loading` is true).
+    //    The server deliberately no-op'd to PROTECT the live session.
+    // Either way we must NOT throw: a throw would propagate to start()'s catch
+    // → `_rollbackStart()` → `invoke("abort")` and tear down the very session
+    // the server kept alive (latent edge b). We also do not open an audio
+    // channel with an empty token (it would route nowhere).
     if (!sessionId) {
       this._dataPlaneLive = false;
-      this._setError(normaliseError(
-        new AmiVoiceError("c", "start() ignored: a recognition session is already active"),
-      ));
+      if (this._values.recognizing === true || this._values.loading === true) {
+        // Genuinely already active: a benign, non-destructive notice.
+        this._setError(normaliseError(
+          new AmiVoiceError("c", "start() ignored: a recognition session is already active"),
+        ));
+      } else if (this._values.error == null) {
+        // Idle server but no cause arrived (e.g. a server whose `error` could
+        // not cross the wire): say the start failed rather than stay silent
+        // or misreport it as "already active".
+        this._setError(normaliseError(
+          new AmiVoiceError("", "start() failed: the server opened no recognition session"),
+        ));
+      }
+      // else: the server-published `error` already names the real cause.
       return;
     }
     // Close any prior audio channel before opening a new one so a re-`start()`

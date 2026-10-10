@@ -202,7 +202,9 @@ describe("<ami-voice> relay-mode start() error edges", () => {
 
   it("an empty server session id is a benign no-op: surfaces an error, does NOT invoke abort", async () => {
     const invoke = vi.fn(async (name: string) => (name === "start" ? "" : undefined));
-    const el = makeRelayShell(invoke);
+    const el = makeRelayShell(invoke) as RelayShell & { _values: Record<string, unknown> };
+    // The bound server state says a session is live: the server ignored the start.
+    el._values.recognizing = true;
 
     await el.start();
 
@@ -210,7 +212,26 @@ describe("<ami-voice> relay-mode start() error edges", () => {
     const names = (el._proxy!.invoke as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
     expect(names).toContain("start");
     expect(names).not.toContain("abort");
-    expect(el.error).not.toBeNull(); // benign notice surfaced
+    expect((el.error as { message: string }).message).toMatch(/already active/); // benign notice surfaced
+    el.remove();
+  });
+
+  it("an empty session id from an IDLE server keeps the server-published cause (no \"already active\" overwrite)", async () => {
+    // relay start() failure: the server published the real cause to `error` and
+    // settled recognizing/loading=false BEFORE resolving null (SPEC §17).
+    const cause = { name: "AmiVoiceError", message: "illegal service authorization", code: "auth" };
+    const invoke = vi.fn(async (name: string) => (name === "start" ? null : undefined));
+    const el = makeRelayShell(invoke) as RelayShell & { _values: Record<string, unknown> };
+    el._values.recognizing = false;
+    el._values.loading = false;
+    el._values.error = cause;
+
+    await el.start();
+
+    const names = (el._proxy!.invoke as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(names).not.toContain("abort");
+    expect(el.error).toBe(cause);
+    expect(el._dataPlaneLive).toBe(false);
     el.remove();
   });
 

@@ -273,9 +273,17 @@ export class AmiVoiceCore extends EventTarget {
    *
    * ```ts
    * core.addEventListener("ami-voice:error", () => {
-   *   if (core.originalError) tracker.captureException(core.originalError);
+   *   try {
+   *     if (core.originalError) tracker.captureException(core.originalError);
+   *   } catch {
+   *     // a tracker that fails must not take the server down
+   *   }
    * });
    * ```
+   *
+   * Catch inside the listener: on Node, `EventTarget` reports a listener's
+   * throw (or an async listener's rejection) as the process's
+   * `uncaughtException`, past the Core, which cannot contain it (SPEC §14).
    *
    * Only failures the Core publishes on `error` appear here. A command that
    * rejects instead — a direct-mode mint failure (SPEC §11.4), anything the

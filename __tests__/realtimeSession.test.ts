@@ -217,6 +217,55 @@ describe("runRealtimeSession — event routing", () => {
   });
 });
 
+/**
+ * The `s` command carries the APPKEY (`authorization=`). `onopen` runs from the
+ * socket's own event dispatch, so a `send` that throws there used to escape
+ * the loop raw — to the platform's uncaught-exception reporting, past the
+ * Core's redaction — while start() waited out the connect deadline.
+ */
+describe("runRealtimeSession — a send of the `s` command that throws", () => {
+  it("rejects the handshake with the thrown value, closes the socket, and never reaches the deadline", async () => {
+    const fake = new FakeSocket();
+    const h = handlers();
+    const thrown = new Error(`cannot send ${START}`);
+    fake.send = () => { throw thrown; };
+    const p = runRealtimeSession(fake, START, h, 5000, /* connectTimeoutMs */ 5);
+
+    expect(() => fake.open()).not.toThrow(); // nothing escapes the socket's event handler
+
+    // The thrown value itself: the Core shapes (and redacts) it with toError.
+    await expect(p).rejects.toBe(thrown);
+    expect(fake.closed).toBe(true); // no close follows a failed send — the loop closes it, like an `s` rejection
+    await new Promise((r) => setTimeout(r, 20)); // past the 5 ms deadline: it was cleared
+    expect(h.calls.error).toBeUndefined();
+    expect(h.calls.close).toBeUndefined();
+  });
+
+  it("passes a non-Error value on as it is", async () => {
+    const fake = new FakeSocket();
+    const thrown = `cannot send ${START}`;
+    fake.send = () => { throw thrown; };
+    const p = runRealtimeSession(fake, START, handlers(), 5000);
+
+    fake.open();
+    await expect(p).rejects.toBe(thrown);
+    expect(fake.closed).toBe(true);
+  });
+
+  it("a send that settles the handshake itself (onerror) before throwing keeps that outcome", async () => {
+    const fake = new FakeSocket();
+    const socketError = new Error("socket error");
+    fake.send = () => {
+      fake.onerror?.(socketError);
+      throw new Error(`cannot send ${START}`);
+    };
+    const p = runRealtimeSession(fake, START, handlers(), 5000);
+
+    expect(() => fake.open()).not.toThrow();
+    await expect(p).rejects.toBe(socketError);
+  });
+});
+
 describe("runRealtimeSession — start-rejection classification (Q7/Q8)", () => {
   it("classifies an s-command rejection as retryable/unknown, not auth", async () => {
     const fake = new FakeSocket();

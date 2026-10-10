@@ -118,7 +118,30 @@ export function runRealtimeSession(
       closeQuietly();
     }, connectTimeoutMs);
     const clearConnectTimer = (): void => { clearTimeout(connectTimer); };
-    socket.onopen = () => socket.send(startCommand);
+    socket.onopen = () => {
+      // `startCommand` carries the APPKEY (`authorization=`; the one-time APPKEY
+      // in direct mode), and a socket can quote what it failed to send in its
+      // exception (message, stack, cause). This handler runs from the socket's
+      // own event dispatch, so a throw left here would bypass the Core's
+      // redaction (`toError` / `toSerializedError`) and reach the platform's
+      // uncaught-exception reporting raw — Node's `uncaughtException` (stderr,
+      // and exit with no handler), a browser's global `error` event / console /
+      // error tracker — while start() stayed `loading` until the connect
+      // deadline. Fail the handshake instead, like an `s` rejection: reject with
+      // the thrown value AS IS (the Core redacts and publishes it, SPEC §14 /
+      // §17) and close the socket, since no close follows a failed send. If the
+      // send already settled the handshake (a synchronous onerror / onclose),
+      // that outcome stands and the throw is dropped.
+      try {
+        socket.send(startCommand);
+      } catch (err) {
+        if (settled) return;
+        settled = true;
+        clearConnectTimer();
+        reject(err);
+        closeQuietly();
+      }
+    };
     socket.onclose = () => {
       clearConnectTimer();
       if (!started) { if (!settled) { settled = true; reject(new AmiVoiceError("!", "AmiVoice connection closed before start")); } return; }

@@ -444,7 +444,9 @@ export class AmiVoiceCore extends EventTarget {
       const session = await this._provider.openRealtimeSession(this._currentOptions(), this._handlers(generation));
       if (generation !== this._sessionGeneration) {
         // A teardown intervened during the handshake; drop the orphaned session.
-        session.abort();
+        // Quietly: the Core has left it, so a custom session's throwing
+        // `abort()` is not this start's failure to publish (SPEC §10, §18).
+        try { session.abort(); } catch { /* released either way */ }
         return null;
       }
       this._session = session;
@@ -489,21 +491,42 @@ export class AmiVoiceCore extends EventTarget {
     }
   }
 
-  /** Immediate teardown — drop the session with no trailing result. */
+  /**
+   * Immediate teardown — drop the session with no trailing result.
+   *
+   * The teardown always runs, even when the session's own `abort()` throws:
+   * the shared loop's never does (its close is quiet), but a custom
+   * provider's session may. Its throw then still reaches the caller — the
+   * remote `abort` command answers with it, as a `throw` the server helper
+   * strips and logs (SPEC §17) — but the Core has left the session first
+   * (`recognizing` / `connected` = false, its callbacks inert, the relay token
+   * reaped). It is not published to `error`. The server helper's `dispose()`
+   * catches it and logs it (SPEC §18).
+   */
   abort(): void {
-    this._session?.abort();
-    this._teardownSession();
+    try {
+      this._session?.abort();
+    } finally {
+      this._teardownSession();
+    }
   }
 
-  /** Clear accumulated results back to idle (also aborts any live session). */
+  /**
+   * Clear accumulated results back to idle (also aborts any live session).
+   * A session `abort()` that throws does not keep the results (see `abort()`);
+   * the throw is the caller's.
+   */
   reset(): void {
-    this.abort();
-    this._setTranscript("");
-    this._setInterim("");
-    this._setSegments([]);
-    this._setSpeakers([]);
-    this._setConfidence(0);
-    this._setError(null);
+    try {
+      this.abort();
+    } finally {
+      this._setTranscript("");
+      this._setInterim("");
+      this._setSegments([]);
+      this._setSpeakers([]);
+      this._setConfidence(0);
+      this._setError(null);
+    }
   }
 
   /** Case-B1 file recognition. Appends results to `segments` / `transcript`. */
@@ -537,8 +560,35 @@ export class AmiVoiceCore extends EventTarget {
    * Push one already-framed audio chunk into the live session. Called by the
    * binary audio channel (docs/adr/0003) — NOT a wcBindable command, so audio
    * never crosses the JSON control wire.
+   *
+   * Never throws. It runs from the relay audio channel's message listener (the
+   * server's `ws` dispatch: a throw there is the server PROCESS's uncaught
+   * exception — Node exits) and from the mic's frame callback. The shared loop
+   * contains its own socket's throw (`failSession`), but a custom provider's
+   * session may throw from `feedAudio`; the Core then ends that session the
+   * same way, once: the thrown value is published to `error` as is (`toError`
+   * redacts it, `originalError` keeps it — SPEC §14 / §17), the session ends
+   * as on an upstream close (`recognizing` / `connected` = false, finalized
+   * state kept, the relay token reaped) without a second error, and the
+   * session is let go of with its `abort()`, quietly. Later frames find no
+   * session and are dropped; whatever the session still delivers is ignored
+   * (its generation is over), and `stop()` / `abort()` afterwards are no-ops.
+   * A session that already ended itself inside `feedAudio` (its own
+   * `onClose`) before throwing has reported its end: the throw is dropped.
    */
   feedAudio(bytes: Uint8Array): void {
-    this._session?.feedAudio(bytes);
+    const session = this._session;
+    if (!session) return;
+    const generation = this._sessionGeneration;
+    try {
+      session.feedAudio(bytes);
+    } catch (err) {
+      if (generation !== this._sessionGeneration) return;
+      this._setError(err);
+      this._teardownSession();
+      // After the teardown, so whatever the session reports from its abort
+      // (an onClose, an onError) finds its callbacks inert.
+      try { session.abort(); } catch { /* the session is over either way */ }
+    }
   }
 }

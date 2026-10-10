@@ -129,3 +129,79 @@ describe("createAmiVoiceRelayServer — injectable structured logging (3.5)", ()
     expect(err.message).not.toContain("PERMANENT-APPKEY");
   });
 });
+
+/**
+ * The helper's own socket callbacks — `dispose()` from the control socket's
+ * `close` listener, the audio channel's `message` listener — run where a throw
+ * is the server process's uncaught exception. What they catch is logged as an
+ * `error` record (redacted, like the Core's), never thrown.
+ */
+describe("createAmiVoiceRelayServer — a throw caught in its own socket callbacks is logged, not thrown", () => {
+  function abortThrowing(value: () => unknown): IRealtimeSession {
+    return { ...fakeSession(), abort: vi.fn(() => { throw value(); }) };
+  }
+
+  it.each([
+    [
+      "a plain object with a code",
+      () => ({ message: "teardown failed: authorization=PERMANENT-APPKEY", code: "auth" }),
+      { type: "error", message: "teardown failed: authorization=<redacted>", code: "auth" },
+    ],
+    ["undefined", () => undefined, { type: "error", message: "undefined" }],
+    [
+      "a hostile value",
+      () => ({ get message(): string { throw new Error("no"); } }),
+      { type: "error", message: "unserializable error value" },
+    ],
+  ])("dispose(): a session abort() that throws %s", async (_label, value, record) => {
+    const events: AmiVoiceServerLogEvent[] = [];
+    const server = createAmiVoiceRelayServer({
+      createProvider: () => fakeProvider(abortThrowing(value)),
+      logger: (e) => events.push(e),
+    });
+    const ctrl = server.handleControlConnection(fakeTransport());
+    await ctrl.core.start();
+
+    expect(() => ctrl.dispose()).not.toThrow();
+
+    expect(ctrl.core.recognizing).toBe(false);
+    expect(server.sessionCount()).toBe(0);
+    expect(events.filter((e) => e.type === "error")).toStrictEqual([record]);
+    expect(events.at(-1)).toMatchObject({ type: "control-close" });
+  });
+
+  it("dispose(): a logger that throws on the record does not make dispose() throw", async () => {
+    const events: AmiVoiceServerLogEvent[] = [];
+    const server = createAmiVoiceRelayServer({
+      createProvider: () => fakeProvider(abortThrowing(() => new Error("teardown failed"))),
+      logger: (e) => { if (e.type === "error") throw new Error("log sink down"); events.push(e); },
+    });
+    const ctrl = server.handleControlConnection(fakeTransport());
+    await ctrl.core.start();
+
+    expect(() => ctrl.dispose()).not.toThrow();
+    expect(events.at(-1)).toMatchObject({ type: "control-close" });
+  });
+
+  it("the audio listener: an unexpected throw is logged once per connection and the frame dropped", async () => {
+    const events: AmiVoiceServerLogEvent[] = [];
+    const server = createAmiVoiceRelayServer({
+      createProvider: () => fakeProvider(fakeSession()),
+      logger: (e) => events.push(e),
+    });
+    const ctrl = server.handleControlConnection(fakeTransport());
+    const token = (await ctrl.core.start()) as string;
+    const socket = new FakeAudioSocket();
+    server.handleAudioConnection(socket, token);
+    vi.spyOn(ctrl.core, "feedAudio").mockImplementation(() => { throw new Error("unexpected"); });
+
+    expect(() => socket.onmessage!({ data: new Uint8Array([1]) })).not.toThrow();
+    expect(() => socket.onmessage!({ data: new Uint8Array([2]) })).not.toThrow();
+
+    expect(events.filter((e) => e.type === "error")).toStrictEqual([
+      { type: "error", message: "unexpected", stack: expect.stringContaining("unexpected") },
+    ]);
+    expect(ctrl.core.error).toBeNull(); // logged only: nothing is published
+    expect(ctrl.core.recognizing).toBe(true);
+  });
+});

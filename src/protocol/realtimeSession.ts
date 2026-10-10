@@ -65,7 +65,7 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
  * the ack reject; failures after it go to `handlers.onError`. A socket that
  * throws never throws out of the loop: a failed `s` send rejects the start, a
  * failed audio send ends the session (`onError`, then `onClose`, once), and a
- * close() that throws is swallowed everywhere but in `abort()`.
+ * close() that throws is swallowed everywhere, `abort()` included.
  *
  * @param socket           already-constructed transport (server WSS or browser WSS).
  * @param startCommand     the fully built `s` command (APPKEY / one-time token baked in).
@@ -119,9 +119,9 @@ export function runRealtimeSession(
   // `RealtimeSocket` is an injectable seam (tests/custom transports), and the
   // loop closes the socket from places a throw must not escape: a socket event
   // handler (`onopen`, the `e` ack, `onclose`), a timer (the connect deadline,
-  // the graceful stop's fallback) and `feedAudio` (the audio channel's message
-  // listener, the mic's frame callback). Every such close is quiet; only
-  // `abort()`, a direct call by the consumer, still closes the socket as is.
+  // the graceful stop's fallback), `feedAudio` (the audio channel's message
+  // listener, the mic's frame callback) and `abort()` (see there). Every close
+  // the loop makes is quiet.
   const closeQuietly = (): void => { try { socket.close(); } catch { /* already settling */ } };
 
   // A `p` frame whose send threw: the session cannot go on. `feedAudio` runs
@@ -341,7 +341,16 @@ export function runRealtimeSession(
       if (released) return;
       intentionalClose = true;
       released = true;
-      socket.close();
+      // Quiet: `abort()` is the consumer's immediate teardown — the Core's
+      // `abort()` / `reset()`, the element's `disconnectedCallback`, the server
+      // helper's `dispose()` from the control socket's `close` listener. A
+      // close() that threw here left the Core's `abort()` before its teardown
+      // (`recognizing` / `connected` stayed true, the relay token routable),
+      // and reached the caller: the element's removal, the remote command, and
+      // in relay the server PROCESS (`uncaughtException`: Node exits). The
+      // abort always completes; a socket that never reports its close is let
+      // go of all the same (SPEC §18).
+      closeQuietly();
     },
   }));
 }

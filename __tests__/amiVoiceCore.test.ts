@@ -637,3 +637,169 @@ describe("AmiVoiceCore segment normalization (custom providers)", () => {
     expect(core.interim).toBe("");
   });
 });
+
+/**
+ * A custom provider's session (`IRealtimeSession` from `openRealtimeSession`)
+ * is not the shared loop: its `feedAudio` / `abort` may throw. `feedAudio`
+ * runs from the relay audio channel's listener (the server's `ws` dispatch)
+ * and the mic's frame callback, so a throw left there reached the server
+ * process. The Core ends the session instead, observably like the loop's own
+ * failed audio send: one `error` (through `toError`), `recognizing` /
+ * `connected` = false, the session let go of (`abort()`, quietly), later
+ * frames dropped (SPEC §17). A throwing `abort()` no longer skips the Core's
+ * teardown (SPEC §18).
+ */
+describe("AmiVoiceCore: a custom session that throws", () => {
+  function throwingSession(opts: { feed?: (h: RealtimeSessionHandlers) => never; abort?: () => never }) {
+    let captured: RealtimeSessionHandlers | undefined;
+    const sessions: IRealtimeSession[] = [];
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: async (_options, handlers) => {
+        captured = handlers;
+        const session: IRealtimeSession = {
+          feedAudio: vi.fn(() => { if (opts.feed) opts.feed(handlers); }),
+          stop: vi.fn(async () => {}),
+          abort: vi.fn(() => { if (opts.abort) opts.abort(); }),
+        };
+        sessions.push(session);
+        return session;
+      },
+      recognizeFile: async () => [],
+    };
+    return { provider, sessions, handlers: () => captured! };
+  }
+
+  /** Every non-null `ami-voice:error` detail `core` dispatches. */
+  function errorsOf(core: AmiVoiceCore): unknown[] {
+    const seen: unknown[] = [];
+    core.addEventListener("ami-voice:error", (e) => { const d = (e as CustomEvent).detail; if (d != null) seen.push(d); });
+    return seen;
+  }
+
+  it("feedAudio that throws: published once, the session ends and is aborted; later frames are dropped", async () => {
+    const thrown = new Error("feed failed: authorization=PERMANENT-APPKEY");
+    const f = throwingSession({ feed: () => { throw thrown; } });
+    const core = new AmiVoiceCore(f.provider);
+    const errors = errorsOf(core);
+    await core.start();
+    f.handlers().onFinal({ text: "こんにちは", confidence: 0.9, starttime: 0, endtime: 1, tokens: [] });
+
+    expect(() => core.feedAudio(new Uint8Array([1]))).not.toThrow();
+    core.feedAudio(new Uint8Array([2]));
+
+    const session = f.sessions[0];
+    expect(session.feedAudio).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(errors).toStrictEqual([{ name: "Error", message: "feed failed: authorization=<redacted>" }]);
+    expect(core.originalError).toBe(thrown); // the thrown instance, redacted in place
+    expect(thrown.message).toBe("feed failed: authorization=<redacted>");
+    expect(core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(core.transcript).toBe("こんにちは"); // finalized state is kept (SPEC §10.1)
+
+    // What the session still delivers is ignored; stop() / abort() afterwards are no-ops.
+    f.handlers().onError(new Error("connection lost"));
+    f.handlers().onFinal({ text: "!", confidence: 0.5, starttime: 1, endtime: 2, tokens: [] });
+    await core.stop();
+    core.abort();
+    expect(session.stop).not.toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(core.transcript).toBe("こんにちは");
+
+    // A new start() is accepted.
+    await expect(core.start()).resolves.toBeNull();
+    expect(core.recognizing).toBe(true);
+    expect(f.sessions).toHaveLength(2);
+  });
+
+  it("feedAudio that throws a non-Error value: published as an Error, the session ends", async () => {
+    const f = throwingSession({ feed: () => { throw "feed failed"; } });
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+
+    core.feedAudio(new Uint8Array([1]));
+
+    expect(core.error).toStrictEqual({ name: "Error", message: "feed failed" });
+    expect(core.originalError).toBeInstanceOf(Error);
+    expect(core.recognizing).toBe(false);
+  });
+
+  it("an abort() that throws on that path stays inside", async () => {
+    const f = throwingSession({
+      feed: () => { throw new Error("feed failed"); },
+      abort: () => { throw new Error("abort failed"); },
+    });
+    const core = new AmiVoiceCore(f.provider);
+    const errors = errorsOf(core);
+    await core.start();
+
+    expect(() => core.feedAudio(new Uint8Array([1]))).not.toThrow();
+
+    expect(f.sessions[0].abort).toHaveBeenCalledTimes(1);
+    expect(errors).toStrictEqual([{ name: "Error", message: "feed failed" }]); // the abort's throw is not published
+    expect(core.recognizing).toBe(false);
+  });
+
+  it("a session that ended itself inside feedAudio before throwing: the throw is not published on top", async () => {
+    const f = throwingSession({
+      feed: (h) => { h.onError(new Error("upstream gone")); h.onClose(); throw new Error("feed failed"); },
+    });
+    const core = new AmiVoiceCore(f.provider);
+    const errors = errorsOf(core);
+    await core.start();
+
+    core.feedAudio(new Uint8Array([1]));
+
+    expect(errors).toStrictEqual([{ name: "Error", message: "upstream gone" }]);
+    expect(f.sessions[0].abort).not.toHaveBeenCalled(); // the Core had already left it
+    expect(core.recognizing).toBe(false);
+  });
+
+  it("abort() whose session abort() throws: the Core still tears down, and the throw is the caller's", async () => {
+    const thrown = new Error("abort failed");
+    const f = throwingSession({ abort: () => { throw thrown; } });
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+
+    expect(() => core.abort()).toThrow(thrown);
+
+    expect(core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(core.error).toBeNull(); // a failed abort is the command's rejection, not a published failure
+    await expect(core.start()).resolves.toBeNull();
+    expect(core.recognizing).toBe(true);
+  });
+
+  it("a session released after a cancelled handshake whose abort() throws: nothing is published", async () => {
+    const session: IRealtimeSession = {
+      feedAudio: vi.fn(), stop: vi.fn(async () => {}), abort: vi.fn(() => { throw new Error("abort failed"); }),
+    };
+    let resolveOpen!: (s: IRealtimeSession) => void;
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: () => new Promise<IRealtimeSession>((r) => { resolveOpen = r; }),
+      recognizeFile: async () => [],
+    };
+    const core = new AmiVoiceCore(provider);
+    const errors = errorsOf(core);
+    const starting = core.start();
+    core.abort(); // mid-handshake
+    resolveOpen(session);
+
+    await expect(starting).resolves.toBeNull();
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual([]); // the Core had already left it (SPEC §10)
+    expect(core).toMatchObject({ recognizing: false, connected: false, loading: false, error: null });
+  });
+
+  it("reset() whose session abort() throws: the Core still clears back to idle", async () => {
+    const f = throwingSession({ abort: () => { throw new Error("abort failed"); } });
+    const core = new AmiVoiceCore(f.provider);
+    await core.start();
+    f.handlers().onFinal({ text: "x", confidence: 0.5, starttime: 0, endtime: 1, tokens: [] });
+
+    expect(() => core.reset()).toThrow("abort failed");
+
+    expect(core).toMatchObject({
+      recognizing: false, connected: false, transcript: "", interim: "", segments: [], speakers: [], confidence: 0, error: null,
+    });
+  });
+});

@@ -10,7 +10,7 @@ import { AmiVoiceProvider, type AmiVoiceProviderOptions } from "../src/providers
 import { DirectBrowserProvider } from "../src/components/realtimeSocket";
 import { AmiVoice } from "../src/components/AmiVoice";
 import type { RealtimeSocket } from "../src/protocol/realtimeSession";
-import type { DirectSessionInfo } from "../src/types";
+import type { DirectSessionInfo, IAmiVoiceProvider } from "../src/types";
 import { memoryTransportPair, captureConsole, type MemoryTransportPair } from "./support/memoryTransport";
 import { reachableStrings } from "./support/reachableStrings";
 
@@ -32,6 +32,14 @@ import { reachableStrings } from "./support/reachableStrings";
  *     Core stayed `recognizing`, the Shell held every later start() behind it.
  *  3. A socket that reports `open` after the handshake failed: it was sent the
  *     `s` command — the APPKEY.
+ *  4. An abort whose `socket.close()` throws: the throw left `abort()`, so the
+ *     Core skipped its teardown (`recognizing` / `connected` stayed true, the
+ *     relay token stayed routable) and the caller got the exception — the
+ *     element's `disconnectedCallback`, the remote `abort` / `reset` command,
+ *     and the server's `dispose()` from the control socket's `close` listener
+ *     (the server PROCESS: `uncaughtException`, Node exits).
+ *  5. A custom provider's session (`createProvider`) whose `feedAudio` throws:
+ *     the relay audio channel's listener let it through to the server process.
  */
 
 /** The permanent APPKEY (registered by the provider) and a one-time APPKEY (not registered). */
@@ -210,11 +218,34 @@ class WsAudioSocket extends EventEmitter implements AudioSocketLike {
   }
 }
 
+/**
+ * The server end of the browser's control WebSocket, as the `ws` library hands
+ * it over. The integrator disposes the session from its `close` listener
+ * (`sock.on("close", () => session.dispose())`, examples/relayServer.mjs),
+ * which `ws` calls from its socket's I/O callback: a throw there is the server
+ * process's uncaught exception.
+ */
+class WsControlSocket extends EventEmitter {
+  /** The browser goes away: emit `close` the way `ws` dispatches it. */
+  hangUp(): Promise<void> {
+    return new Promise((resolve) => {
+      setImmediate(() => {
+        try { this.emit("close", 1001, Buffer.alloc(0)); } finally { resolve(); }
+      });
+    });
+  }
+}
+
 /** A relay server over the real `AmiVoiceProvider` (`socketFactory` upstream), a client bound to it, and the log. */
 function relaySetup(socketFactory: (url: string) => RealtimeSocket, provider: AmiVoiceProviderOptions = {}) {
+  return relayOver(() => new AmiVoiceProvider({ appKey: APPKEY, socketFactory, ...provider }));
+}
+
+/** A relay server over `createProvider`, a client bound to it, and the log. */
+function relayOver(createProvider: () => IAmiVoiceProvider) {
   const events: AmiVoiceServerLogEvent[] = [];
   const relay = createAmiVoiceRelayServer({
-    createProvider: () => new AmiVoiceProvider({ appKey: APPKEY, socketFactory, ...provider }),
+    createProvider,
     logger: (e) => events.push(e),
   });
   const pair = memoryTransportPair();
@@ -367,9 +398,205 @@ describe("relay: a socket that reports `open` after the handshake failed (SPEC �
   });
 });
 
+/** The `throw` replies the server sent. */
+function throwReplies(pair: MemoryTransportPair): unknown[] {
+  return pair.wire
+    .filter((f) => f.startsWith("S:"))
+    .map((f) => JSON.parse(f.slice(2)) as { type: string; error?: unknown })
+    .filter((m) => m.type === "throw")
+    .map((m) => m.error);
+}
+
+describe("relay: the upstream socket's close() throws when the session is aborted (SPEC §18)", () => {
+  it.each(["abort", "reset"] as const)("the `%s` command: answered without a throw, the session ends, its token is reaped", async (command) => {
+    const con = captureConsole();
+    const upstream = guardedUpstream({ close: "throws" });
+    const { relay, pair, ctrl, events, proxy, values } = relaySetup(upstream.socketFactory);
+    const token = await proxy.invoke("start");
+    const audio = new WsAudioSocket();
+    expect(relay.handleAudioConnection(audio, token as string)).toBe(true);
+
+    await expect(proxy.invoke(command)).resolves.toBeUndefined();
+    await settle();
+
+    expect(throwReplies(pair)).toEqual([]);
+    expect(values).toMatchObject({ recognizing: false, connected: false, loading: false, error: null });
+    expect(ctrl.core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(upstream.conns[0].closeCalls).toBe(1); // the upstream close was attempted, once
+    expect(relay.sessionCount()).toBe(0);
+
+    await audio.receive([1, 2, 3]); // a frame still in flight goes nowhere
+    expect(upstream.conns[0].audioAttempts).toBe(0);
+    expect(errorUpdates(pair)).toEqual([]);
+    expect(events.filter((e) => e.type === "error")).toEqual([]);
+
+    await expect(proxy.invoke("start")).resolves.toEqual(expect.any(String));
+    expect(upstream.conns).toHaveLength(2);
+    expect(unhandled).toEqual([]);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("the control channel closes (dispose from the `close` listener): the session ends, nothing reaches the server process", async () => {
+    captureConsole();
+    const upstream = guardedUpstream({ close: "throws" });
+    const { relay, ctrl, events, proxy } = relaySetup(upstream.socketFactory);
+    const token = await proxy.invoke("start");
+    expect(relay.handleAudioConnection(new WsAudioSocket(), token as string)).toBe(true);
+    const control = new WsControlSocket();
+    control.on("close", () => ctrl.dispose());
+
+    await control.hangUp();
+    await settle();
+
+    expect(unhandled).toEqual([]);
+    expect(ctrl.core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(upstream.conns[0].closeCalls).toBe(1);
+    expect(relay.sessionCount()).toBe(0);
+    expect(events.filter((e) => e.type === "error")).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: "control-close" });
+  });
+
+  it("a custom session whose abort() throws: dispose still ends the session, and logs the throw redacted", async () => {
+    const con = captureConsole();
+    vi.stubEnv("AMIVOICE_APPKEY", APPKEY); // the helper registers it, as a deployment's environment would
+    const custom = customSession({ abortThrows: () => new Error(`teardown failed for key ${APPKEY}`) });
+    const { relay, ctrl, events, proxy } = relayOver(() => custom.provider);
+    const token = await proxy.invoke("start");
+    expect(relay.handleAudioConnection(new WsAudioSocket(), token as string)).toBe(true);
+    const control = new WsControlSocket();
+    control.on("close", () => ctrl.dispose());
+
+    await control.hangUp();
+    await settle();
+
+    expect(unhandled).toEqual([]);
+    expect(custom.calls.abort).toBe(1);
+    expect(ctrl.core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(relay.sessionCount()).toBe(0);
+    expect(events.filter((e) => e.type === "error")).toStrictEqual([{
+      type: "error",
+      message: "teardown failed for key <redacted>",
+      stack: expect.stringContaining("teardown failed for key <redacted>"),
+    }]);
+    expect(events.at(-1)).toMatchObject({ type: "control-close" });
+    expect(leaks(ctrl.core.originalError, events, con.messages(), unhandled)).toEqual([]);
+  });
+});
+
+/** A custom provider's realtime session (`createProvider`): `feedAudio` / `abort` throw what the options make. */
+function customSession(opts: { feedThrows?: () => unknown; abortThrows?: () => unknown }): {
+  provider: IAmiVoiceProvider;
+  calls: { feed: number; stop: number; abort: number };
+  /** Every value the session threw. */
+  thrown: unknown[];
+} {
+  const calls = { feed: 0, stop: 0, abort: 0 };
+  const thrown: unknown[] = [];
+  const fail = (make?: () => unknown): void => {
+    if (!make) return;
+    const value = make();
+    thrown.push(value);
+    throw value;
+  };
+  return {
+    provider: {
+      openRealtimeSession: async () => ({
+        feedAudio: () => { calls.feed++; fail(opts.feedThrows); },
+        stop: async () => { calls.stop++; },
+        abort: () => { calls.abort++; fail(opts.abortThrows); },
+      }),
+      recognizeFile: async () => [],
+    },
+    calls,
+    thrown,
+  };
+}
+
+/** What a custom session's failed `feedAudio` says: the upstream refused the APPKEY, quoted bare. */
+const FEED_FAILED = `audio rejected: upstream refused key ${APPKEY}`;
+const FEED_FAILED_PUBLISHED = { name: "Error", message: "audio rejected: upstream refused key <redacted>" };
+
+describe("relay: a custom provider's session throws from feedAudio (SPEC §17)", () => {
+  it.each([
+    ["an Error", () => new Error(FEED_FAILED), undefined],
+    ["a bare string", () => FEED_FAILED, undefined],
+    ["an Error, and its abort() throws too", () => new Error(FEED_FAILED), () => new Error(`abort failed for key ${APPKEY}`)],
+  ] as const)("%s: one redacted `error` on the client, the session ends, nothing reaches the server process", async (_label, feedThrows, abortThrows) => {
+    const con = captureConsole();
+    vi.stubEnv("AMIVOICE_APPKEY", APPKEY);
+    const custom = customSession({ feedThrows, abortThrows });
+    const { relay, pair, ctrl, events, proxy, values } = relayOver(() => custom.provider);
+    const token = await proxy.invoke("start");
+    expect(values.recognizing).toBe(true);
+    const audio = new WsAudioSocket();
+    expect(relay.handleAudioConnection(audio, token as string)).toBe(true);
+
+    for (let i = 0; i < 3; i++) await audio.receive([1, 2, 3]);
+    await settle();
+
+    expect(unhandled).toEqual([]); // the server process never saw it
+    expect(custom.calls.feed).toBe(1); // later frames are not fed to the failed session
+    expect(custom.calls.abort).toBe(1); // the Core lets go of it (its upstream)
+    expect(values.error).toStrictEqual(FEED_FAILED_PUBLISHED);
+    expect(errorUpdates(pair)).toStrictEqual([FEED_FAILED_PUBLISHED]); // exactly once
+    expect(values).toMatchObject({ recognizing: false, connected: false, loading: false });
+    const original = ctrl.core.originalError!;
+    if (typeof custom.thrown[0] === "string") expect(original).toBeInstanceOf(Error);
+    else expect(original).toBe(custom.thrown[0]); // the thrown instance, redacted in place
+    expect(original.message).toBe(FEED_FAILED_PUBLISHED.message);
+    expect(relay.sessionCount()).toBe(0); // the audio token is reaped with the session
+    expect(events.filter((e) => e.type === "error")).toStrictEqual([
+      expect.objectContaining({ type: "error", message: FEED_FAILED_PUBLISHED.message }),
+    ]);
+
+    // stop() / abort() afterwards are no-ops on the failed session, and a new start() is accepted.
+    await within(proxy.invoke("stop"), 1000);
+    await proxy.invoke("abort");
+    await settle();
+    expect(custom.calls).toMatchObject({ stop: 0, abort: 1 });
+    expect(errorUpdates(pair)).toHaveLength(1);
+    expect(throwReplies(pair)).toEqual([]);
+    await expect(proxy.invoke("start")).resolves.toEqual(expect.any(String));
+
+    expect(leaks(ctrl.core.originalError, events, pair.wire, con.messages(), unhandled)).toEqual([]);
+    expect(unhandled).toEqual([]);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("the audio listener's last line of defence: an unexpected throw from the Core is logged once, redacted, and published nowhere", async () => {
+    const con = captureConsole();
+    const upstream = guardedUpstream();
+    const { relay, pair, events, proxy, values } = relaySetup(upstream.socketFactory);
+    const token = await proxy.invoke("start");
+    const audio = new WsAudioSocket();
+    expect(relay.handleAudioConnection(audio, token as string)).toBe(true);
+    const feed = vi.spyOn(AmiVoiceCore.prototype, "feedAudio").mockImplementation(() => {
+      throw new Error(`unexpected: s LSB16K -a-general authorization=${APPKEY}`);
+    });
+
+    for (let i = 0; i < 3; i++) await audio.receive([1, 2, 3]);
+    await settle();
+
+    expect(unhandled).toEqual([]);
+    expect(feed).toHaveBeenCalledTimes(3);
+    expect(events.filter((e) => e.type === "error")).toStrictEqual([{
+      type: "error",
+      message: `unexpected: ${S_REDACTED}`,
+      stack: expect.stringContaining(`unexpected: ${S_REDACTED}`),
+    }]);
+    expect(errorUpdates(pair)).toEqual([]); // the helper reports to its log only: no second `error`
+    expect(values.recognizing).toBe(true);  // and decides nothing about the session
+
+    feed.mockRestore();
+    await audio.receive([4]);
+    expect(upstream.conns[0].audioAttempts).toBe(1);
+    expect(leaks(events, pair.wire, con.messages(), unhandled)).toEqual([]);
+  });
+});
+
 // ── local / direct: the real Shell and its real MicCapture frame callback ────
 
-type Shell = HTMLElement & Pick<AmiVoice, "start" | "stop" | "error" | "recognizing" | "connected" | "loading"> & {
+type Shell = HTMLElement & Pick<AmiVoice, "start" | "stop" | "abort" | "error" | "recognizing" | "connected" | "loading"> & {
   _core: AmiVoiceCore | null;
 };
 
@@ -548,12 +775,43 @@ describe("local: the upstream socket's close() throws when a graceful stop settl
     expect(el.recognizing).toBe(true);
     expect(ws.sockets).toHaveLength(2);
 
-    // End the second session the same way. (The element's teardown would
-    // abort a live one, and `abort()`'s own close is not guarded.)
+    // End the second session the same way.
     await within(el.stop(), 1000);
     expect(el.recognizing).toBe(false);
     expect(ws.sockets.map((s) => s.closeCalls)).toEqual([1, 1]);
     expect(errors).toEqual([]);
+    expect(unhandled).toEqual([]);
+  });
+});
+
+describe.each([
+  ["local (in-page Core, permanent APPKEY)", mountLocal],
+  ["direct (in-page Core, one-time APPKEY)", mountDirect],
+])("%s: the upstream socket's close() throws when the session is aborted (SPEC §18)", (_label, mount) => {
+  it.each([
+    ["the element is removed from the DOM", (el: Shell): void => { el.remove(); }],
+    ["el.abort()", (el: Shell): void => { el.abort(); }],
+  ])("%s: nothing escapes, the Core tears down, the mic stops", async (_how, end) => {
+    const con = captureConsole();
+    const ws = upstreamWebSocket({ closeThrows: true });
+    const mic = stubMicrophone();
+    const el = mount();
+    const errors = errorsOf(el);
+
+    await el.start();
+    const core = el._core!;
+    expect(core.recognizing).toBe(true);
+
+    expect(() => end(el)).not.toThrow();
+    await settle();
+
+    expect(core).toMatchObject({ recognizing: false, connected: false, loading: false });
+    expect(ws.sockets).toHaveLength(1);
+    expect(ws.sockets[0].closeCalls).toBe(1); // the upstream close was attempted, once
+    expect(mic.live()).toBe(false);
+    expect(mic.tracksStopped()).toBe(true);
+    expect(errors).toEqual([]);
+    expect(leaks(errors, con.messages(), unhandled)).toEqual([]);
     expect(unhandled).toEqual([]);
   });
 });

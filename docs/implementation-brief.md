@@ -72,7 +72,7 @@
 - **3.3 コーデック拡張（Q9・gated）**: telephony が要件化したら `8K`＋`MULAW`/`ALAW` を [pcmEncoder.ts](../src/audio/pcmEncoder.ts) に追加。Shell は未対応 `codec` を**拒否**。
 - **3.4 デプロイ時セキュリティプロファイル**: auth-before-shell・per-command 認可・rate limit・音声 token を `Sec-WebSocket-Protocol`・`JsonValue` リソース上限を、ドキュメント＋例で示す（SPEC §14, [ADR 0002](adr/0002-appkey-residency-and-remote-first.md)）。例サーバの `TODO(auth)` プレースホルダを実装ガイドに昇格。
 - **3.5 構造化ロギング**: server helper に注入可能な `Logger`（connection open/close、拒否フレーム、emit したエラー）。
-- **3.6 カバレッジ & 公開準備**: カバレッジゲート、README/SPEC のバージョン参照確定、**`CLAUDE.md`「Implementation status」を実態に整合**、version bump、[release skill](../.claude/skills/release/SKILL.md) で公開（`@wc-bindable/*` が `^0.8.0`・`file:` 依存なしを確認）。`npm publish` は**ユーザが手動**で行う（Claude は実行しない）。
+- **3.6 カバレッジ & 公開準備**: カバレッジゲート、README/SPEC のバージョン参照確定、**`CLAUDE.md`「Implementation status」を実態に整合**、version bump、[release skill](../.claude/skills/release/SKILL.md) で公開（`@wc-bindable/*` が `^0.10.0`・`file:` 依存なしを確認）。`npm publish` は**ユーザが手動**で行う（Claude は実行しない）。
 
 ---
 
@@ -200,7 +200,7 @@
 - 再接続（Q3）・必要なコーデック（Q9）・diarization 方針（Q6）が決定済み（gated は「非対応を明記」でも可）。
 - デプロイ時セキュリティプロファイルと注入ロギングがドキュメント＋例で提示済み。
 - カバレッジゲート通過。`CLAUDE.md`/`SPEC.md`/README のバージョン・状態記述が実態と整合（特に `CLAUDE.md`「Implementation status」が実態どおり）。
-- マニフェストが publishable（`@wc-bindable/*` が `^0.8.0` semver、`file:` 依存なし）。`npm run build` クリーン。**`npm publish` はユーザが手動実行**（[release skill](../.claude/skills/release/SKILL.md)）。
+- マニフェストが publishable（`@wc-bindable/*` が `^0.10.0` semver、`file:` 依存なし）。`npm run build` クリーン。**`npm publish` はユーザが手動実行**（[release skill](../.claude/skills/release/SKILL.md)）。
 
 ---
 

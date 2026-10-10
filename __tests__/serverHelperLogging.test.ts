@@ -3,6 +3,7 @@ import {
   createAmiVoiceRelayServer,
   type AudioSocketLike, type AmiVoiceServerLogEvent,
 } from "../src/createAmiVoiceServer";
+import { AmiVoiceError } from "../src/errorCodes";
 import type {
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers, RecognitionOptions,
 } from "../src/types";
@@ -72,6 +73,32 @@ describe("createAmiVoiceRelayServer — injectable structured logging (3.5)", ()
 
     const err = events.find((e) => e.type === "error");
     expect(err).toMatchObject({ type: "error", message: "upstream exploded" });
+  });
+
+  it("the shell SENDS the error update to the client (remote >= 0.10 no longer drops it)", async () => {
+    // Before the fix the Core emitted an AmiVoiceError instance: the logger above
+    // still fired, but @wc-bindable/remote 0.10 warned `dropped update for "error"`
+    // and the browser never saw the failure (SPEC §17). Pin the wire side too.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const transport = fakeTransport() as unknown as { send: ReturnType<typeof vi.fn> };
+    const provider: IAmiVoiceProvider = {
+      openRealtimeSession: async () => { throw new AmiVoiceError("-", "illegal service authorization"); },
+      recognizeFile: async () => [],
+    };
+    const server = createAmiVoiceRelayServer({ createProvider: () => provider, logger: () => {} });
+
+    const ctrl = server.handleControlConnection(transport as never);
+    await ctrl.core.start();
+
+    const errorUpdates = transport.send.mock.calls.map((c) => c[0])
+      .filter((m: { type: string; name?: string }) => m.type === "update" && m.name === "error");
+    expect(errorUpdates).toContainEqual({
+      type: "update",
+      name: "error",
+      value: { name: "AmiVoiceError", message: "illegal service authorization", code: "auth", resultCode: "-", retryable: false },
+    });
+    expect(warn.mock.calls.map((c) => String(c[0]))).not.toContainEqual(expect.stringContaining("dropped update"));
+    warn.mockRestore();
   });
 
   it("defaults to a no-op logger (no throw without a logger)", async () => {

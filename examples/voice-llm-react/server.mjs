@@ -24,9 +24,18 @@
 //   peer BEFORE these handlers; this demo accepts everyone so it runs offline.
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
-// One remote version for BOTH channels: as of @csbc-dev/ai-agent@0.2.0 both
-// packages target @wc-bindable/* ^0.8, so a single @wc-bindable/remote serves the
-// <ami-voice> relay control channel and the <ai-agent> remote command channel.
+// Remote versions — MIXED until both packages ship @wc-bindable 0.10 releases.
+// This example pins @wc-bindable/* ^0.10.0, so the RemoteShellProxy /
+// WebSocketServerTransport imported here are 0.10. But the currently published
+// @csbc-dev/ami-voice@0.1.x and @csbc-dev/ai-agent@0.2.0 both still declare
+// @wc-bindable/remote ^0.8.0, so npm installs a nested 0.8 copy under each
+// (their 0.10-compatible releases are in preparation, not yet published):
+//   • <ami-voice>: createAmiVoiceRelayServer runs ami-voice's own 0.8 shell
+//     (fed by the 0.10 WebSocketServerTransport below — the transport interface
+//     is unchanged), talking to the element's own 0.8 client proxy.
+//   • <ai-agent>: AiCore (0.2.0) is wrapped in the 0.10 RemoteShellProxy below,
+//     with its strict JsonValue gate, while the <ai-agent> element still uses
+//     its own 0.8 client proxy.
 import { WebSocketServerTransport, RemoteShellProxy } from "@wc-bindable/remote";
 import { createAmiVoiceRelayServer, AmiVoiceProvider } from "@csbc-dev/ami-voice/server";
 import { wsSocketFactory, startFakeRealtime, handleFakeLlm } from "./fakes.mjs";

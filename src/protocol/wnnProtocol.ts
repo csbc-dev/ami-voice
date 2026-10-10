@@ -138,6 +138,33 @@ export function toSegment(payload: RawPayload): RecognitionSegment {
   return segment;
 }
 
+/**
+ * Re-normalize an already-shaped finalized segment — e.g. one a CUSTOM
+ * `IAmiVoiceProvider` hands the Core via `onFinal` / `recognizeFile` — to exactly
+ * the public `RecognitionSegment` model, with the same `num()` / `str()` / token
+ * rules `toSegment` applies to raw `A` payloads (non-finite → 0, non-string → "",
+ * optional `utteranceid` / `label` / `language` OMITTED unless a string, unknown
+ * keys dropped).
+ *
+ * The Core runs every finalized segment through this (SPEC §8) because
+ * `segments` / `speakers` cross the `@wc-bindable/remote` wire as strict
+ * `JsonValue`s: a single `utteranceid: undefined` or `confidence: NaN` would make
+ * remote ≥ 0.10 drop EVERY later `segments` update until `reset()`. Idempotent on
+ * segments `toSegment` already produced.
+ */
+export function normalizeSegment(raw: unknown): RecognitionSegment {
+  const r = (raw ?? {}) as RawResult & { utteranceid?: unknown };
+  const segment: RecognitionSegment = {
+    text: str(r.text),
+    confidence: num(r.confidence),
+    starttime: num(r.starttime),
+    endtime: num(r.endtime),
+    tokens: normalizeTokens(r.tokens),
+  };
+  if (typeof r.utteranceid === "string") segment.utteranceid = r.utteranceid;
+  return segment;
+}
+
 function safeJson(raw: string): RawPayload {
   try {
     const parsed = JSON.parse(raw);

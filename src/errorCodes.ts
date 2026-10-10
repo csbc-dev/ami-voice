@@ -40,6 +40,12 @@ const CODE_MAP: Record<string, AmiVoiceErrorCode> = {
 /** Result codes AmiVoice classifies as client errors (resolve, do not retry). */
 const CLIENT_ERROR_CHARS = new Set([">", "o", "+", "-", "%"]);
 
+/** Every member of the closed `AmiVoiceErrorCode` union (for `getErrorCode`'s narrowing). */
+const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<AmiVoiceErrorCode>([
+  ...Object.values(CODE_MAP),
+  "unknown",
+]);
+
 /** Map a single-character AmiVoice result code to the normalized union. */
 export function mapResultCode(code: string): AmiVoiceErrorCode {
   return CODE_MAP[code] ?? "unknown";
@@ -72,12 +78,23 @@ export class AmiVoiceError extends Error {
 }
 
 /**
- * Read the normalized `code` off a bound `error` value if it is an
- * `AmiVoiceError`, else `undefined` (plan 1.8). Locally the `error` property
- * holds the real `AmiVoiceError` (so `code` is available); over the
- * `@wc-bindable/remote` wire only `{ name, message }` survive, so a remote
- * consumer gets `undefined` here and falls back to `error.message`.
+ * Read the normalized `code` off a bound `error` value, else `undefined`
+ * (plan 1.8). Works for every shape `error` takes, in every mode:
+ *
+ *   - the Core's published JSON-safe `SerializedError` (`{ name, message,
+ *     code?, resultCode?, retryable? }` — identical locally and over the
+ *     `@wc-bindable/remote` wire, so `code` survives relay mode),
+ *   - an in-process `AmiVoiceError`,
+ *   - a remote-revived `Error` carrying the producer's `code` (e.g. a
+ *     direct-mode mint rejection; remote ≥ 0.10 forwards `code`).
+ *
+ * Only members of the closed `AmiVoiceErrorCode` union are returned; any other
+ * `code` (a `WC_BINDABLE_*` transport code, a Node `ECONNRESET`, …) and a
+ * code-less error yield `undefined` — fall back to `error.message` then.
  */
 export function getErrorCode(err: unknown): AmiVoiceErrorCode | undefined {
-  return err instanceof AmiVoiceError ? err.code : undefined;
+  if (err instanceof AmiVoiceError) return err.code;
+  if (typeof err !== "object" || err === null) return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === "string" && KNOWN_ERROR_CODES.has(code) ? (code as AmiVoiceErrorCode) : undefined;
 }

@@ -3,13 +3,17 @@ import {
   RecognitionOptions, RecognitionSegment,
 } from "../types.js";
 import type {
-  WcsAmiVoiceAnyError, AmiVoiceCodec, AmiVoiceEngine,
+  SerializedError, AmiVoiceCodec, AmiVoiceEngine,
   AmiVoiceTransport, DirectSessionInfo, DirectMintOptions, SpeakerSegment,
 } from "../types.js";
-import { normaliseError } from "../normaliseError.js";
+import { toSerializedError, toError } from "../normaliseError.js";
 import { AmiVoiceError } from "../errorCodes.js";
 import { toSpeakerSegment } from "../speakerView.js";
+import { normalizeSegment } from "../protocol/wnnProtocol.js";
 import { DEFAULT_CODEC } from "../audio/pcmEncoder.js";
+
+/** Default `engine` (`grammar_file_names`) — what a `null` / `undefined` write restores (SPEC §7.2). */
+const DEFAULT_ENGINE: AmiVoiceEngine = "-a-general";
 
 /** Observable outputs Core publishes, paired with `ami-voice:<name>-changed`. */
 const CORE_PROPERTY_NAMES = [
@@ -106,7 +110,7 @@ export class AmiVoiceCore extends EventTarget {
   private _sessionGeneration = 0;
 
   // inputs
-  private _engine: AmiVoiceEngine = "-a-general";
+  private _engine: AmiVoiceEngine = DEFAULT_ENGINE;
   private _codec: AmiVoiceCodec = DEFAULT_CODEC;
   private _profileId = "";
   private _profileWords = "";
@@ -124,7 +128,13 @@ export class AmiVoiceCore extends EventTarget {
   private _speakers: SpeakerSegment[] = [];
   private _confidence = 0;
   private _loading = false;
-  private _error: WcsAmiVoiceAnyError = null;
+  /**
+   * Always a JSON-safe plain object (or `null`), never an `Error` instance: it
+   * is read by the remote `sync` and carried by the `update`, both of which
+   * remote ≥ 0.10 validates as a strict `JsonValue` (SPEC §17). See
+   * `toSerializedError`.
+   */
+  private _error: SerializedError | null = null;
 
   /**
    * @param provider APPKEY-bearing AmiVoice access.
@@ -155,22 +165,28 @@ export class AmiVoiceCore extends EventTarget {
   }
 
   // ── inputs ──────────────────────────────────────────────────────────────────
+  // `null` / `undefined` RESETS an input to its default (SPEC §7.2; wc-bindable
+  // SPEC-extensions § Producer guidance P1/P2). `undefined` cannot cross the
+  // remote wire (it is not a JsonValue), so a remote client — e.g. the Shell
+  // forwarding React 19's `undefined` on a removed prop — sends `null`. Without
+  // the reset, `engine`/`codec` would be stored as-is and `buildStartCommand`
+  // would emit `s null null …` / `s LSB16K undefined …`.
   get engine(): AmiVoiceEngine { return this._engine; }
-  set engine(v: AmiVoiceEngine) { this._engine = v; }
+  set engine(v: AmiVoiceEngine | null | undefined) { this._engine = v ?? DEFAULT_ENGINE; }
   get codec(): AmiVoiceCodec { return this._codec; }
-  set codec(v: AmiVoiceCodec) { this._codec = v; }
+  set codec(v: AmiVoiceCodec | null | undefined) { this._codec = v ?? DEFAULT_CODEC; }
   get profileId(): string { return this._profileId; }
-  set profileId(v: string) { this._profileId = v; }
+  set profileId(v: string | null | undefined) { this._profileId = v ?? ""; }
   get profileWords(): string { return this._profileWords; }
-  set profileWords(v: string) { this._profileWords = v; }
+  set profileWords(v: string | null | undefined) { this._profileWords = v ?? ""; }
   get keepFillerToken(): boolean { return this._keepFillerToken; }
-  set keepFillerToken(v: boolean) { this._keepFillerToken = v; }
+  set keepFillerToken(v: boolean | null | undefined) { this._keepFillerToken = v ?? false; }
   get resultUpdatedInterval(): number { return this._resultUpdatedInterval; }
-  set resultUpdatedInterval(v: number) { this._resultUpdatedInterval = v; }
+  set resultUpdatedInterval(v: number | null | undefined) { this._resultUpdatedInterval = v ?? 0; }
   get segmenterProperties(): string { return this._segmenterProperties; }
-  set segmenterProperties(v: string) { this._segmenterProperties = v; }
+  set segmenterProperties(v: string | null | undefined) { this._segmenterProperties = v ?? ""; }
   get noLog(): boolean { return this._noLog; }
-  set noLog(v: boolean) { this._noLog = v; }
+  set noLog(v: boolean | null | undefined) { this._noLog = v ?? false; }
 
   // ── outputs (read-only) ──────────────────────────────────────────────────────
   get recognizing(): boolean { return this._recognizing; }
@@ -181,7 +197,7 @@ export class AmiVoiceCore extends EventTarget {
   get speakers(): SpeakerSegment[] { return this._speakers; }
   get confidence(): number { return this._confidence; }
   get loading(): boolean { return this._loading; }
-  get error(): WcsAmiVoiceAnyError { return this._error; }
+  get error(): SerializedError | null { return this._error; }
 
   private _setRecognizing(v: boolean): void { if (this._recognizing !== v) { this._recognizing = v; this._emit("recognizing", v); } }
   private _setConnected(v: boolean): void { if (this._connected !== v) { this._connected = v; this._emit("connected", v); } }
@@ -191,7 +207,16 @@ export class AmiVoiceCore extends EventTarget {
   private _setSpeakers(v: SpeakerSegment[]): void { this._speakers = v; this._emit("speakers", v); }
   private _setConfidence(v: number): void { if (this._confidence !== v) { this._confidence = v; this._emit("confidence", v); } }
   private _setLoading(v: boolean): void { if (this._loading !== v) { this._loading = v; this._emit("loading", v); } }
-  private _setError(v: WcsAmiVoiceAnyError): void { this._error = v; this._emit("error", v); }
+  /**
+   * Publish a failure (or `null` to clear). Every thrown value is shaped by
+   * `toSerializedError` HERE, so the getter and the emitted detail are the same
+   * JSON-safe, redacted object — the one choke-point for what crosses the wire.
+   */
+  private _setError(err: unknown): void {
+    const v = toSerializedError(err);
+    this._error = v;
+    this._emit("error", v);
+  }
 
   private _currentOptions(): RecognitionOptions {
     return {
@@ -211,20 +236,30 @@ export class AmiVoiceCore extends EventTarget {
       onSegmentStart: () => { /* S — reserved for VAD-driven UI hooks */ },
       onSegmentEnd: () => { /* E — reserved for VAD-driven UI hooks */ },
       onRecognitionStart: () => { /* C */ },
-      onInterim: (r) => { this._setInterim(r.text); },
+      // A custom provider's interim may lack `text`; keep `interim` a string.
+      onInterim: (r) => { this._setInterim(typeof r?.text === "string" ? r.text : ""); },
       onFinal: (r) => { this._appendFinal(r); },
-      onError: (e) => { this._setError(normaliseError(e)); },
+      onError: (e) => { this._setError(e); },
       onClose: () => { this._teardownSession(); },
     };
   }
 
-  private _appendFinal(segment: RecognitionSegment): void {
+  /**
+   * Append one finalized segment. It is re-normalized first (`normalizeSegment`)
+   * because a custom provider may hand over `utteranceid: undefined` or a NaN
+   * `confidence`; one such non-JsonValue entry in `segments` would make remote
+   * ≥ 0.10 drop every later `segments` / `speakers` update until `reset()`.
+   * Returns the normalized segment.
+   */
+  private _appendFinal(raw: RecognitionSegment): RecognitionSegment {
+    const segment = normalizeSegment(raw);
     this._setSegments([...this._segments, segment]);
     // `speakers` is the derived, final-only speaker view (docs/adr/0007).
     this._setSpeakers([...this._speakers, toSpeakerSegment(segment)]);
     this._setTranscript(this._transcript + segment.text);
     this._setConfidence(segment.confidence);
     this._setInterim("");
+    return segment;
   }
 
   private _teardownSession(): void {
@@ -243,14 +278,19 @@ export class AmiVoiceCore extends EventTarget {
    *
    * Relay/local: opens the AmiVoice WSS; failures publish to `error` rather than
    * reject. Returns the minted session id (relay) for the browser to bind its
-   * audio channel to, or `null` (local / on failure).
+   * audio channel to, or `null` (local / on failure / already active). On a
+   * failure the `error` update is emitted BEFORE this resolves, so on the
+   * ordered control channel the browser already holds the real cause (and
+   * `recognizing=false`, `loading=false`) when it sees the `null`.
    *
    * Direct (docs/adr/0006): the Core opens NO upstream — it mints a one-time
    * APPKEY + approved `s` command and returns them as `DirectSessionInfo` for the
    * browser to open the WSS itself. Mint failures REJECT here (rather than
    * publishing to this server-side Core's `error`, which the browser does not
    * bind) so the failure surfaces over `invoke("start")` to the browser's
-   * in-page Core, which then publishes it to the bound `error`.
+   * in-page Core, which then publishes it to the bound `error`. The rejection is
+   * always an `Error` instance (`toError`): remote ≥ 0.10 turns a non-Error
+   * throw into `NonErrorThrow` / `"[object Object]"`, losing the cause.
    */
   async start(): Promise<string | DirectSessionInfo | null> {
     if (this._recognizing || this._loading) return null;
@@ -280,8 +320,8 @@ export class AmiVoiceCore extends EventTarget {
       this._setRecognizing(true);
       return this._mintSessionId ? this._mintSessionId() : null;
     } catch (err) {
-      if (this._transport === "direct") throw normaliseError(err);
-      this._setError(normaliseError(err));
+      if (this._transport === "direct") throw toError(err);
+      this._setError(err);
       this._teardownSession();
       return null;
     } finally {
@@ -306,7 +346,7 @@ export class AmiVoiceCore extends EventTarget {
     try {
       await session.stop();
     } catch (err) {
-      this._setError(normaliseError(err));
+      this._setError(err);
     } finally {
       this._teardownSession();
     }
@@ -345,10 +385,11 @@ export class AmiVoiceCore extends EventTarget {
       // slate — drop the stale file results rather than repopulate the cleared
       // transcript/segments/speakers/confidence.
       if (generation !== this._sessionGeneration) return [];
-      for (const seg of segments) this._appendFinal(seg);
-      return segments;
+      // Return the normalized segments (what `segments` now holds), not the
+      // provider's raw objects.
+      return segments.map((seg) => this._appendFinal(seg));
     } catch (err) {
-      this._setError(normaliseError(err));
+      this._setError(err);
       return [];
     } finally {
       this._setLoading(false);

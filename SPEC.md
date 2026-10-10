@@ -74,7 +74,7 @@ The element declares a `static wcBindable` (protocol `"wc-bindable"`, version `1
 | `speakers` | `SpeakerSegment[]` | Core | Speaker-labeled finalized turns, derived from `segments`. **Final-only** (updates on `A`, never `U`) ([ADR 0007](docs/adr/0007-diarization-speaker-view.md)). |
 | `confidence` | `number` | Core | Latest finalized-segment confidence. **Final-only** (updates on `A`, never `U`). |
 | `loading` | `boolean` | Core | A start / file request is in flight. |
-| `error` | `Error \| SerializedError \| null` | Core/Shell | Last error (signal). |
+| `error` | `SerializedError \| Error \| null` | Core/Shell | Last error (signal). Core-published errors are a plain JSON-safe `{ name, message, code?, resultCode?, retryable? }` in every mode; an error the Shell raises itself (codec rejection, mic denial, a rejected control-channel call) is an `Error` (§17). |
 | `level` | `number` | **Shell** | Mic input level for a meter (data-plane projection, not a Core decision). |
 | `mode` | `"local" \| "remote"` | Shell | Active mode. |
 
@@ -94,6 +94,8 @@ Inputs are Core policy, forwarded by the Shell. Security-relevant inputs MUST be
 | `resultUpdatedInterval` | `number` | `resultUpdatedInterval` (ms) |
 | `segmenterProperties` | `string` | `segmenterProperties` |
 | `noLog` | `boolean` | selects the `/nolog/` endpoint |
+
+**Reset (`null` / `undefined`).** Assigning `null` — or, in-process, `undefined` — to any input MUST reset it to its default rather than store the value: `engine` → `-a-general`, `codec` → `LSB16K`, `profileId` / `profileWords` / `segmenterProperties` → `""` (omitted from `s`), `keepFillerToken` / `noLog` → `false`, `resultUpdatedInterval` → `0` (omitted from `s`). `undefined` and non-finite numbers are not `JsonValue`s and cannot cross the control channel (`@wc-bindable/remote` ≥ 0.10 rejects them), so the element forwards `undefined` (e.g. React 19 removing a prop) and `NaN` / `±Infinity` as `null`. (wc-bindable SPEC-extensions § Producer guidance for inputs, P1/P2.)
 
 ### 7.3 Commands (element surface)
 
@@ -117,6 +119,8 @@ The Core normalizes AmiVoice payloads; raw wire JSON is never exposed as public 
 
 On a finalized result the Core MUST: append the segment to `segments`, append its derived turn to `speakers`, append its text to `transcript`, set `confidence` to the segment's confidence, and clear `interim`.
 
+The Core MUST re-normalize every finalized segment it accepts — including one a custom `IAmiVoiceProvider` hands over — to exactly the model above: non-finite numbers become `0`, non-strings `""`, optional members (`utteranceid`, token `label` / `language`) are omitted unless they are strings, and unknown keys are dropped. `segments` / `speakers` cross the control channel as strict `JsonValue`s; a single `undefined` member or `NaN` would make `@wc-bindable/remote` ≥ 0.10 drop every later `segments` update.
+
 ## 9. Recognition modes
 
 - **Realtime (Case C).** Microphone → two-channel relay → AmiVoice WSS → interim/final results. The element's primary mode.
@@ -136,7 +140,7 @@ The Core MUST publish failures to `error` rather than rejecting `start()` (consu
 
 AmiVoice's realtime endpoint has **no resume**: if the upstream WSS drops mid-stream, the in-flight utterance is lost. The v1 recovery policy is **explicit restart** (implementation-notes Q3):
 
-- On an upstream close the Core did **not** initiate (i.e. not a `stop()`/`abort()`/disconnect teardown), the Core MUST publish an `error` (normalized `code: "upstream"`) and set `connected = false` (and `recognizing = false`). It MUST require the consumer to call `start()` again to resume — it MUST NOT auto-reconnect in v1.
+- On an upstream close the Core did **not** initiate (i.e. not a `stop()`/`abort()`/disconnect teardown), the Core MUST publish an `error` (normalized `code: "upstream"`, in the JSON-safe shape of §17 so it reaches the browser in relay mode) and set `connected = false` (and `recognizing = false`). It MUST require the consumer to call `start()` again to resume — it MUST NOT auto-reconnect in v1.
 - Already-**finalized** state MUST be preserved across the drop: `transcript`, `segments`, and `confidence` MUST NOT be cleared by the teardown (only `interim` is in-flight and may be dropped). A subsequent `start()` continues appending to the existing `transcript`.
 - A teardown the Core initiated (`stop()` graceful close, `abort()`, or a lost-`e`-ack fallback settle — §18) MUST NOT be surfaced as an `error`.
 
@@ -223,9 +227,10 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 
 ## 17. Error contract
 
-- Recognition / provider failures (start, session I/O, file recognition) **publish to `error` and clear `loading`** — they MUST NOT reject the command Promise. Consumers bind `error`.
+- Recognition / provider failures (start, session I/O, file recognition) **publish to `error` and clear `loading`** — they MUST NOT reject the command Promise. Consumers bind `error`. In relay mode a failed `start()` resolves `null` only after the `error` (and `recognizing` / `loading` = `false`) updates were emitted; the Shell MUST keep that server-published cause rather than replace it with its own "already active" notice (which is reserved for a server that is still `recognizing` / `loading`).
 - AmiVoice rejections carry a single-character result `code` (`-` auth, `+` unsupported format, `%` audio too large, `$` client-audio timeout, `o` below-threshold, `b` server busy, `x` grammar not loaded, `c` cancelled, `?` fatal server error, `!`/`>`/`<`/`#` recognizer connect/send/receive/parse (upstream) failures, `^` invalid parameter). The Core SHOULD normalize these into a closed `AmiVoiceErrorCode` union while preserving the raw `message`; the client-error subset (`>`, `o`, `+`, `-`, `%`) is non-retryable.
-- Over the network, only a serializable `{ name, message, stack? }` shape crosses (per `@wc-bindable/remote`); a producer SHOULD redact `stack` on untrusted boundaries.
+- **Wire shape.** The Core's `error` (its getter AND the `ami-voice:error` detail it emits) MUST be a plain JSON-safe `SerializedError` — `{ name, message, code?, resultCode?, retryable? }`, absent keys omitted (never `undefined`), no `stack`, `message` redacted (§14) — in every mode. `@wc-bindable/remote` ≥ 0.10 validates property values as strict `JsonValue`s and drops anything else (an `Error` instance is dropped from `update` and reported as a `sync` `getterFailures` entry), so an `Error` here would never reach the browser. Because the shape is identical locally and over the wire, `getErrorCode(error)` returns the normalized `code` in every mode.
+- **Direct-mode mint failures** reject `invoke("start")` (§11.4) and therefore cross as a `@wc-bindable/remote` `throw` envelope. The Core MUST reject with an `Error` instance (a non-`Error` throw is canonicalized to `NonErrorThrow` with an unusable `message`); the envelope carries `name`, `message`, `code` and the redacted `stack` (`resultCode` / `retryable` do not cross). The browser's in-page Core then publishes it in the wire shape above.
 - Precondition violations that are programmer errors (e.g. a missing APPKEY server-side) MAY throw synchronously in the provider.
 
 ## 18. Cancellation contract
@@ -279,5 +284,6 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 | Codec rejection (§13) | Implemented + tested — Shell refuses a `codec` it cannot encode (v1: `LSB16K` only); `8K`/`MULAW`/`ALAW` out of scope (Q9) |
 | Structured logging (§14) | Implemented + tested — injectable `logger` on `createAmiVoiceRelayServer` (open/close, rejected audio, emitted errors; no secrets) |
 | Coverage gate | Implemented — `npm run test:coverage` over the portable logic layer |
+| `@wc-bindable/remote` 0.10 `JsonValue` gate (§7.2, §8, §17) | Implemented + tested — JSON-safe Core `error`, re-normalized `segments`, `null` input reset, Error-only direct-mint rejection; unit suites through the real 0.10 proxies (`__tests__/remoteWire*.test.ts`) + Node integration failure paths (rejected `s`, upstream drop) |
 
 Both transports are implemented and verified end to end in Node and a real browser, and the Phase 3 hardening is in place. **Relay**: browser mic data plane → control proxy → Core → provider WSS loop; binary audio over a `Sec-WebSocket-Protocol`-correlated channel → server helper → `feedAudio`. **Direct** (docs/adr/0006): the control proxy mints (one-time APPKEY + approved `s`); the browser opens the AmiVoice WSS itself and streams audio direct, reusing the shared `runRealtimeSession` loop — the permanent APPKEY never leaves the server and the bindable surface is byte-identical. What remains is a real-AmiVoice smoke run (gated behind `AMIVOICE_APPKEY`) and the user-driven release (version bump + `npm publish`). Resolved/remaining tuning decisions are tracked in [docs/implementation-notes.md](docs/implementation-notes.md).

@@ -4,7 +4,7 @@ Sequenced delivery plan for `@csbc-dev/ami-voice`. Roles of the docs: [ADRs](.) 
 
 ## Current status — Phases 1 & 2 complete; Phase 3 hardening done
 
-Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 154 unit + 3 Node integration + 2 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
+Scaffold, relay implementation, the full relay e2e, browser-direct mode, AND the Phase 3 hardening are done and green (build clean; 199 unit + 5 Node integration + 2 real-browser Playwright; coverage gate over the portable logic layer). Only the user-driven release (version bump + `npm publish`) and a real-AmiVoice smoke run remain.
 
 - Bindable surface, Core state machine, target injection, `s`/`p`/`e` builder + `S/E/C/U/A/G` parser, PCM/`LSB16K` encoder, Shell (local/relay/direct, two-channel wiring), mic capture (browser-runtime).
 - Provider realtime WSS loop (injectable socket; shared `runRealtimeSession`), `recognizeFile` (async v2), one-time-APPKEY mint + `prepareDirectSession`, error-code normalization.
@@ -43,7 +43,7 @@ Make the relay path actually recognize speech, observable in a real browser, wit
 - [x] **1.5 Audio back-pressure** — `shouldSendFrame(bufferedAmount, cap)` (1 MiB default) drops frames under pressure in `_sendAudioRemote`; pure helper unit-tested. Refs: Q10.
 - [x] **1.6 Shell `stop()` graceful wait** — the Shell stops capture + closes the audio channel immediately, then awaits the Core/provider graceful stop (which settles on the `e` ack). Refs: Q4/D1.
 - [x] **1.7 User-facing `README.md`** — quickstart (remote relay), server snippet, `O(audio volume)` cost note, security checklist. Refs: SPEC §20/§14.
-- [x] **1.8 Error surfacing** — `getErrorCode(error)` returns the normalized `code` for a local `AmiVoiceError`, `undefined` for a remote-decoded `{name,message}`; documented. Tested. Refs: Q7, SPEC §17.
+- [x] **1.8 Error surfacing** — `getErrorCode(error)` returns the normalized `code`. Originally local-only (`undefined` for a remote-decoded error); since the `@wc-bindable/remote` 0.10 upgrade the Core publishes `error` as a JSON-safe `{ name, message, code?, resultCode?, retryable? }` object — identical locally and over the wire, because 0.10 drops a non-`JsonValue` (`Error` instance) property value — so `getErrorCode` works in every mode. Tested (incl. through the real 0.10 proxies). Refs: Q7, SPEC §17.
 
 **Phase 1 — done.** A developer can `npm run example`, open a page, click start, speak (or feed the fake), and see live transcript — with a README that explains the deployment. The relay loop is proven end-to-end in both Node (`test:integration`) and a real browser (`test:e2e`). Next: **Phase 2 — browser-direct mode** (the `issueOneTimeAppKey` seam already exists).
 
@@ -71,7 +71,7 @@ Add the single-channel, `O(connections)` path enabled by the one-time APPKEY. Re
 - [x] **3.3 Codec scope** (gated → documented non-support) — telephony not in scope (Q9), so `8K`/`MULAW`/`ALAW` are **not** added. The non-gated correctness part **is** done: the Shell now **rejects** a `codec` it cannot encode (`canEncodeCodec`; v1 = `LSB16K`) on `start()` rather than silently streaming `LSB16K`. SPEC §13; tested.
 - [x] **3.4 Deployment security profile** (M) — auth-before-shell, per-command authz, audio token via `Sec-WebSocket-Protocol`, rate/resource limits, direct-mode mint validation, observability documented in SPEC §14 + README; the example's `TODO(auth)` is promoted to an `authenticatePeer`/`authorize` seam. Refs: SPEC §14, ADR 0002.
 - [x] **3.5 Structured logging** (S) — injectable `logger` on `createAmiVoiceRelayServer` (control open/close, rejected audio frames, emitted Core errors as normalized `code` + message; never the APPKEY/token/payloads). Tested. Refs: implementation-notes B/Q11.
-- [~] **3.6 Coverage + release prep** (M) — coverage gate done (`npm run test:coverage`, thresholds over the portable logic layer); README/SPEC/CLAUDE status synced. **Remaining (user-driven):** confirm + bump version, then publish via the [release skill](../.claude/skills/release/SKILL.md) (`@wc-bindable/*` are `^0.8.0`, no `file:`). `npm publish` is manual.
+- [~] **3.6 Coverage + release prep** (M) — coverage gate done (`npm run test:coverage`, thresholds over the portable logic layer); README/SPEC/CLAUDE status synced. **Remaining (user-driven):** confirm + bump version, then publish via the [release skill](../.claude/skills/release/SKILL.md) (`@wc-bindable/*` are `^0.10.0`, no `file:`). `npm publish` is manual.
 
 **Phase 3 done when:** the package is production-deployable and `0.x` publishable. Code/docs/coverage are in place; the version bump + publish are the user's manual release step.
 

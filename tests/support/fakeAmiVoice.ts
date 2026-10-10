@@ -20,6 +20,8 @@ export interface FakeAmiVoiceOptions {
 export interface FakeAmiVoiceHandle {
   url: string;
   connectionCount(): number;
+  /** Terminate every open upstream socket — an unsolicited mid-session drop (SPEC §10.1). */
+  dropAll(): void;
   close(): Promise<void>;
 }
 
@@ -62,6 +64,7 @@ export function startFakeAmiVoice(opts: FakeAmiVoiceOptions = {}): Promise<FakeA
       resolve({
         url: `ws://127.0.0.1:${port}/`,
         connectionCount: () => connections,
+        dropAll: () => { for (const client of wss.clients) client.terminate(); },
         close: () => new Promise<void>((r) => wss.close(() => r())),
       });
     });

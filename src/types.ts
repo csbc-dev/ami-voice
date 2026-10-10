@@ -235,14 +235,40 @@ export interface IAmiVoiceProvider {
 
 // ── Error shapes ─────────────────────────────────────────────────────────────
 
-/** Cross-realm-safe serialized error, used when a real `Error` cannot cross. */
+/**
+ * Cross-realm-safe serialized error — a plain, JSON-safe object.
+ *
+ * This is the shape the Core publishes on its `error` property (and as the
+ * `ami-voice:error` detail it emits) in EVERY mode (SPEC §17). It must be a
+ * strict `JsonValue` because in relay mode the value crosses the
+ * `@wc-bindable/remote` wire, and remote ≥ 0.10 DROPS a non-JsonValue property
+ * value (an `Error` instance never arrives). Optional keys are therefore
+ * OMITTED when absent, never set to `undefined` (an `undefined` member is not a
+ * JsonValue either).
+ */
 export interface SerializedError {
   name: string;
   message: string;
+  /** Only on Shell-side / cross-realm shapes; the Core never publishes a stack (SPEC §17). */
   stack?: string;
+  /**
+   * Normalized `AmiVoiceErrorCode` for an AmiVoice failure; otherwise any string
+   * `code` the source error carried (e.g. a `WC_BINDABLE_*` remote code). Read
+   * it with `getErrorCode()`, which narrows to the AmiVoice taxonomy.
+   */
+  code?: string;
+  /** Raw single-character AmiVoice result code (from an `AmiVoiceError`). */
+  resultCode?: string;
+  /** `false` for the documented AmiVoice client errors (from an `AmiVoiceError`). */
+  retryable?: boolean;
 }
 
-/** The shape kept in the `error` observable. */
+/**
+ * The shape kept in the element's `error` observable: the Core's published
+ * `SerializedError`, or an `Error` the Shell raised itself (codec rejection,
+ * mic denial, a rejected control-channel call). Read fields (`name` /
+ * `message` / `code`) or use `getErrorCode()` rather than `instanceof`.
+ */
 export type WcsAmiVoiceAnyError = Error | SerializedError | null;
 
 // ── Observable value shapes (the `bind()` surface) ───────────────────────────
@@ -263,11 +289,14 @@ export interface AmiVoiceCoreValues {
   /** Latest finalized-segment confidence (final-only; updates on `A`). */
   confidence: number;
   loading: boolean;
-  error: WcsAmiVoiceAnyError;
+  /** Last error as a JSON-safe plain object (identical locally and over the wire — SPEC §17). */
+  error: SerializedError | null;
 }
 
 /** Shell value shape: Core outputs plus the Shell-projected UI state. */
 export interface AmiVoiceValues extends AmiVoiceCoreValues {
+  /** Core-published `SerializedError`, or an `Error` the Shell raised itself. */
+  error: WcsAmiVoiceAnyError;
   /** Mic input level for a meter — Shell-projected, not a Core decision. */
   level: number;
   /** Active mode, surfaced for UIs. */

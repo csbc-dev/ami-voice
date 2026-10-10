@@ -1,6 +1,6 @@
 import { AmiVoiceCore } from "./core/AmiVoiceCore.js";
 import { AmiVoiceProvider } from "./providers/AmiVoiceProvider.js";
-import type { IAmiVoiceProvider, AmiVoiceTransport, WcsAmiVoiceAnyError } from "./types.js";
+import type { IAmiVoiceProvider, AmiVoiceTransport, SerializedError } from "./types.js";
 import { getErrorCode, type AmiVoiceErrorCode } from "./errorCodes.js";
 import { redactSecrets } from "./redact.js";
 import { RemoteShellProxy, type ServerTransport } from "@wc-bindable/remote";
@@ -144,8 +144,10 @@ export function createAmiVoiceRelayServer(
       }
       const shell = new RemoteShellProxy(core, transport);
       // Log emitted Core errors (normalized code + message only — never payloads).
+      // The detail is the Core's JSON-safe `SerializedError` — the same object the
+      // shell forwards to the browser as the `error` update (SPEC §17).
       const onCoreError = (e: Event): void => {
-        const detail = (e as CustomEvent<WcsAmiVoiceAnyError>).detail;
+        const detail = (e as CustomEvent<SerializedError | null>).detail;
         if (detail) log({ type: "error", code: getErrorCode(detail), message: redactSecrets(detail.message) });
       };
       core.addEventListener("ami-voice:error", onCoreError);

@@ -237,15 +237,34 @@ describe("<ami-voice> relay-mode start() error edges", () => {
 
   it("rolls back via invoke('abort') when the audio channel fails after a fresh session opened", async () => {
     const invoke = vi.fn(async (name: string) => (name === "start" ? "SESSION-1" : undefined));
-    const el = makeRelayShell(invoke);
+    const el = makeRelayShell(invoke) as RelayShell & { _values: Record<string, unknown> };
+    // The server opened the session: it set `recognizing=true` before replying
+    // with the token (SPEC §10.2), so the bound state says live at the reply.
+    el._values.recognizing = true;
     // A real token came back, but opening the audio channel / mic throws.
     el._startMicRemote = vi.fn(async () => { throw new Error("audio channel failed"); }) as never;
 
     await el.start();
 
+    expect(el._startMicRemote).toHaveBeenCalledWith("SESSION-1");
     const names = (el._proxy!.invoke as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
     expect(names).toContain("start");
     expect(names).toContain("abort"); // a genuine partial start IS rolled back
+    el.remove();
+  });
+
+  it("a token whose session is no longer live at the reply is released, never armed", async () => {
+    const invoke = vi.fn(async (name: string) => (name === "start" ? "SESSION-1" : undefined));
+    const el = makeRelayShell(invoke) as RelayShell & { _values: Record<string, unknown> };
+    el._values.recognizing = false; // the session ended before the reply arrived
+    el._startMicRemote = vi.fn(async () => {}) as never;
+
+    await el.start();
+
+    expect(el._startMicRemote).not.toHaveBeenCalled();
+    expect(el._dataPlaneLive).toBe(false);
+    const names = (el._proxy!.invoke as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(names).toEqual(["start", "abort"]);
     el.remove();
   });
 });

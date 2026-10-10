@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
@@ -38,8 +38,18 @@ async function startRelayServer(amivoiceUrl: string): Promise<RelayServer> {
   });
 
   const sessions = new Map<unknown, AmiVoiceControlSession>();
-  const controlWss = new WebSocketServer({ port: 0 });
+  // The control port also accepts the audio channel, routed by subprotocol
+  // presence like the example / browser harness (a single-port relay): the
+  // `<ami-voice>` Shell opens its audio channel on the control URL.
+  const controlWss = new WebSocketServer({
+    port: 0,
+    handleProtocols: (protocols) => [...protocols][0] ?? false,
+  });
   controlWss.on("connection", (sock) => {
+    if (sock.protocol) {
+      relay.handleAudioConnection(sock, sock.protocol);
+      return;
+    }
     const session = relay.handleControlConnection(new WebSocketServerTransport(sock));
     sessions.set(sock, session);
     sock.on("close", () => { session.dispose(); sessions.delete(sock); });
@@ -65,15 +75,56 @@ async function startRelayServer(amivoiceUrl: string): Promise<RelayServer> {
   };
 }
 
+/**
+ * Just enough `HTMLElement` to run the `<ami-voice>` Shell under Node: attributes
+ * plus the (native) EventTarget it dispatches `ami-voice:*` on. The test drives
+ * the custom-element lifecycle hooks by hand; everything else — the control and
+ * audio WebSockets (Node's native `WebSocket`), the 0.10 proxies, the relay
+ * helper, the provider loop, the fake AmiVoice — is real. Only the browser mic
+ * (`getUserMedia` / `AudioWorklet`) is stubbed; Playwright covers it.
+ */
+class ShimHTMLElement extends EventTarget {
+  private readonly _attrs = new Map<string, string>();
+  getAttribute(name: string): string | null { return this._attrs.get(name) ?? null; }
+  setAttribute(name: string, value: string): void {
+    const old = this.getAttribute(name);
+    this._attrs.set(name, value);
+    (this as { attributeChangedCallback?(n: string, o: string | null, v: string): void })
+      .attributeChangedCallback?.(name, old, value);
+  }
+}
+
+type NodeShell = ShimHTMLElement & {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  connectedCallback(): void;
+  disconnectedCallback(): void;
+  readonly interim: string;
+  readonly transcript: string;
+  readonly error: unknown;
+  _audioWs: WebSocket | null;
+  _startMic(onFrame: (bytes: Uint8Array) => void): Promise<void>;
+};
+
+/** Import the Shell with the shim as its `HTMLElement` base (module eval needs it). */
+async function createShell(): Promise<NodeShell> {
+  vi.stubGlobal("HTMLElement", ShimHTMLElement);
+  const { AmiVoice } = await import("../../src/components/AmiVoice");
+  return new (AmiVoice as unknown as new () => NodeShell)();
+}
+
 let fake: FakeAmiVoiceHandle | undefined;
 let server: RelayServer | undefined;
 let unbind: (() => void) | undefined;
+let shell: NodeShell | undefined;
 
 afterEach(async () => {
+  shell?.disconnectedCallback();
   unbind?.();
   await server?.close();
   await fake?.close();
-  unbind = undefined; server = undefined; fake = undefined;
+  vi.unstubAllGlobals();
+  unbind = undefined; server = undefined; fake = undefined; shell = undefined;
 });
 
 describe("relay end-to-end (control + binary audio)", () => {
@@ -159,6 +210,38 @@ describe("relay end-to-end (control + binary audio)", () => {
     expect(values.connected).toBe(false);
     expect(values.recognizing).toBe(false);
     controlWs.close();
+  });
+
+  // SPEC §10.2 / README quick start: `<ami-voice>`.start() right after connect,
+  // before the control channel is even open (so before its initial `sync`). The
+  // sync's `recognizing=false` predates the start; it used to tear the pending
+  // start down, leaving a server session with no mic attached.
+  it("the <ami-voice> Shell: start() before the initial sync streams the mic into the session", async () => {
+    fake = await startFakeAmiVoice();
+    server = await startRelayServer(fake.url);
+    shell = await createShell();
+    const el = shell;
+    el.setAttribute("mode", "remote");
+    el.setAttribute("remote-url", server.controlUrl);
+    el.setAttribute("engine", "-a-general");
+    el.setAttribute("codec", "LSB16K");
+    let micArmed = false;
+    el._startMic = async (onFrame) => {
+      micArmed = true; // stands in for getUserMedia → AudioWorklet → PCM
+      const audio = el._audioWs!;
+      await waitFor(() => audio.readyState === WebSocket.OPEN);
+      onFrame(new Uint8Array([1, 2, 3, 4]));
+    };
+
+    el.connectedCallback(); // opens the control channel (still CONNECTING)
+    await el.start();
+
+    expect(micArmed).toBe(true);
+    // Mic frame → audio channel → relay → Core → fake → `U` → control channel.
+    await waitFor(() => el.interim === "こん");
+    await el.stop();
+    await waitFor(() => el.transcript === "こんにちは");
+    expect(el.error).toBeNull();
   });
 
   it("rejects an audio connection bearing an unknown session token", async () => {

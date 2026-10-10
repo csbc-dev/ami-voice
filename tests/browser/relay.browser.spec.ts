@@ -35,3 +35,28 @@ test("relay: real browser mic → interim → finalized transcript", async ({ pa
   await expect(page.locator("#error")).toHaveText("");
   expect(errors).toEqual([]);
 });
+
+/**
+ * SPEC §10.2 / README quick start: connect the element and call start() in the
+ * same task, so start() runs before the control channel's initial `sync`. The
+ * sync's `recognizing=false` predates the start and must not tear it down —
+ * otherwise the server opens a session with no microphone attached (no audio,
+ * so no interim ever arrives).
+ */
+test("relay: start() right after connect (before the initial sync) streams the mic", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+
+  await page.goto("/?presync");
+  // The element is not in the document yet: no control channel is open.
+  expect(await page.evaluate(() => (window as unknown as { __av: Element }).__av.isConnected)).toBe(false);
+
+  await page.locator("#start").click(); // appendChild + start() in one task
+
+  await expect(page.locator("#status")).toHaveAttribute("data-recognizing", "true");
+  await expect(page.locator("#interim")).toHaveText("こん");
+  await page.locator("#stop").click();
+  await expect(page.locator("#transcript")).toHaveText("こんにちは");
+  await expect(page.locator("#error")).toHaveText("");
+  expect(errors).toEqual([]);
+});

@@ -80,9 +80,29 @@ export class AmiVoice extends HTMLElement {
    * still-running mic (an unsolicited upstream drop) from an already-idle one.
    */
   private _dataPlaneLive = false;
+  /**
+   * Bumped by every `start()` claim and every data-plane teardown
+   * (`_stopDataPlane`: stop/abort/reset, disconnect, session end, rollback).
+   * `start()` captures it and re-checks it after each await: a mismatch means
+   * that start was cancelled or superseded by a newer one, so it must neither
+   * arm the mic nor roll back (which would hit the newer session). Same idiom as
+   * `AmiVoiceCore._sessionGeneration` / `MicCapture._generation`.
+   */
+  private _startGeneration = 0;
+  /**
+   * Generation of the relay `start()` whose `invoke("start")` reply has not
+   * arrived yet (`null`: none). Until it does, a `recognizing=false` from the
+   * control channel may describe the server BEFORE it processed this start — the
+   * initial `sync` snapshot, or the end of the previous session after
+   * `abort(); start()` — so it must not tear the pending start down. The reply
+   * decides instead (SPEC §10.2); nothing of the data plane runs before it.
+   */
+  private _pendingRelayStart: number | null = null;
   /** Bound `recognizing-changed` listener that tears the mic down on session end. */
   private readonly _onRecognizingChanged = (e: Event): void => {
-    if ((e as CustomEvent).detail === false && this._dataPlaneLive) this._stopDataPlane();
+    if ((e as CustomEvent).detail !== false || !this._dataPlaneLive) return;
+    if (this._pendingRelayStart === this._startGeneration) return; // possibly stale — see above
+    this._stopDataPlane();
   };
   /**
    * Mirror every `ami-voice:error` (Shell-set via `_setError`, the relay bind
@@ -199,6 +219,7 @@ export class AmiVoice extends HTMLElement {
     // the first. The server-side Core also guards its own start, but that does
     // not protect the Shell's data plane.
     if (this._dataPlaneLive) return;
+    let generation: number | null = null;
     try {
       // The Shell physically encodes the audio, so it MUST refuse a codec it
       // cannot produce rather than silently stream LSB16K under another label
@@ -215,20 +236,33 @@ export class AmiVoice extends HTMLElement {
       // second start() hits the re-entrancy guard above. The catch's
       // `_rollbackStart()` clears it on failure.
       this._dataPlaneLive = true;
+      generation = ++this._startGeneration;
       this._ensureConnected();
       if (this._core) {
         await this._core.start();
         // A session that opened and immediately dropped during the await above
         // fires `recognizing→false`, whose listener tears the data plane down
-        // and clears the flag. Bail rather than re-arm a mic for a dead session.
-        if (!this._dataPlaneLive) return;
+        // (bumping the generation); a stop()/abort() does the same. Bail rather
+        // than re-arm a mic for a dead or cancelled session.
+        if (generation !== this._startGeneration) return;
+        // A failed start (provider error, direct-mode mint refusal) was published
+        // to `error` and left `recognizing=false` — no change event, since it never
+        // went true — so read the Core: never arm a mic for a session that did
+        // not open (and keep the Core's cause in `error`).
+        if (!this._core.recognizing) {
+          this._stopDataPlane();
+          return;
+        }
         await this._startMic((bytes) => this._core?.feedAudio(bytes));
       } else {
-        const session = await this._proxy!.invoke("start");
-        if (!this._dataPlaneLive) return;
-        await this._startMicRemote(session);
+        await this._startRelay(generation);
       }
     } catch (err) {
+      // A start that was cancelled (stop/abort/reset/disconnect) or superseded
+      // while it awaited is moot: the cancel already tore its session down, and
+      // rolling back now would hit the NEWER start's session. Its failure (e.g.
+      // the proxy's DISPOSED rejection after a disconnect) is not surfaced.
+      if (generation !== null && generation !== this._startGeneration) return;
       // A failure AFTER the upstream session opened — typically a getUserMedia
       // denial or an audio-channel open error — must not strand the session as
       // `recognizing=true` with no audio flowing. Roll the data plane and the
@@ -236,6 +270,40 @@ export class AmiVoice extends HTMLElement {
       this._rollbackStart();
       this._setError(normaliseError(err));
     }
+  }
+
+  /**
+   * Relay half of `start()` (SPEC §10.2). `start()` may run before the control
+   * channel's initial `sync` (the README quick start does), and right after an
+   * `abort()` / `reset()` of a previous session. Either way, control-channel
+   * state that arrives before this start's reply may predate the server's
+   * processing of it, so the `recognizing=false` listener holds off
+   * (`_pendingRelayStart`) and the reply decides. The channel is ordered and the
+   * Core sets `recognizing=true` before returning the session id, so at the reply
+   * `_values.recognizing` is the server's state AFTER this start.
+   */
+  private async _startRelay(generation: number): Promise<void> {
+    this._pendingRelayStart = generation;
+    let session: unknown;
+    try {
+      session = await this._proxy!.invoke("start");
+    } finally {
+      if (this._pendingRelayStart === generation) this._pendingRelayStart = null;
+    }
+    // Cancelled while pending: the stop/abort/reset was sent AFTER the start on
+    // the ordered channel (and a disconnect closes the channel, which the server
+    // answers with a dispose → abort), so the server tears this session down
+    // itself — no mic, and no abort of ours (it could hit a newer start).
+    if (generation !== this._startGeneration) return;
+    if (session && this._values.recognizing !== true) {
+      // A session id, but the session already ended before the reply arrived
+      // (e.g. an upstream drop). Never arm a mic for it; the abort is a
+      // best-effort guarantee that no server session outlives this start.
+      this._stopDataPlane();
+      void this._proxy?.invoke("abort").catch(() => { /* best-effort */ });
+      return;
+    }
+    await this._startMicRemote(session);
   }
 
   /** Best-effort teardown of a partially-started session (see `start()`'s catch). */
@@ -253,6 +321,7 @@ export class AmiVoice extends HTMLElement {
    */
   private _stopDataPlane(): void {
     this._dataPlaneLive = false;
+    this._startGeneration++; // cancels any start() still awaiting (see _startGeneration)
     this._mic?.stop();
     this._closeAudio();
   }
@@ -392,6 +461,7 @@ export class AmiVoice extends HTMLElement {
     );
     // Target injection (`this`): the in-page Core fires `ami-voice:*` from the element.
     this._core = new AmiVoiceCore(provider, this);
+    this._applyCachedInputs(this._core);
   }
 
   private _connectLocal(): void {
@@ -400,6 +470,21 @@ export class AmiVoice extends HTMLElement {
     // the page. Production is remote-first (docs/adr/0002). Target injection
     // (`this`) makes Core events fire directly from the element.
     this._core = new AmiVoiceCore(new AmiVoiceProvider(), this);
+    this._applyCachedInputs(this._core);
+  }
+
+  /**
+   * Apply inputs written before this Core existed — initial attributes, property
+   * writes on a not-yet-connected element, or the values a re-connected element
+   * held — to a freshly built in-page Core (local + direct). The in-page
+   * counterpart of the control proxy's replay in `_connectControlProxy`. Resets
+   * were dropped from the cache (`_writeInput`), so a fresh Core keeps its
+   * default for them (SPEC §7.2).
+   */
+  private _applyCachedInputs(core: AmiVoiceCore): void {
+    for (const [name, value] of Object.entries(this._inputCache)) {
+      (core as unknown as Record<string, unknown>)[name] = value;
+    }
   }
 
   private async _startMicRemote(session: unknown): Promise<void> {

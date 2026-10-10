@@ -97,6 +97,8 @@ Inputs are Core policy, forwarded by the Shell. Security-relevant inputs MUST be
 
 **Reset (`null` / `undefined`).** Assigning `null` — or, in-process, `undefined` — to any input MUST reset it to its default rather than store the value: `engine` → `-a-general`, `codec` → `LSB16K`, `profileId` / `profileWords` / `segmenterProperties` → `""` (omitted from `s`), `keepFillerToken` / `noLog` → `false`, `resultUpdatedInterval` → `0` (omitted from `s`). `undefined` and non-finite numbers are not `JsonValue`s and cannot cross the control channel (`@wc-bindable/remote` ≥ 0.10 rejects them), so the element forwards `undefined` (e.g. React 19 removing a prop) and `NaN` / `±Infinity` as `null`. (wc-bindable SPEC-extensions § Producer guidance for inputs, P1/P2.)
 
+**Before connect.** Inputs MAY be set before the element connects — as initial attributes (`engine`, `codec`, `profile-id`, `no-log`) or as properties of a not-yet-connected element. The element caches them and MUST apply them to the Core it connects to, in every mode: replayed with `setWithAck` over the control channel (relay / direct — the server Core) and assigned to the in-page Core when that Core is created (local / direct). The same holds for a re-connected element's fresh Core. A reset made before connect is not replayed: a fresh Core already holds the default.
+
 ### 7.3 Commands (element surface)
 
 | Command | Async | Meaning |
@@ -145,6 +147,18 @@ AmiVoice's realtime endpoint has **no resume**: if the upstream WSS drops mid-st
 - A teardown the Core initiated (`stop()` graceful close, `abort()`, or a lost-`e`-ack fallback settle — §18) MUST NOT be surfaced as an `error`.
 
 Auto-reconnect (re-opening the upstream and re-sending `s` while keeping the browser session) is a deferred enhancement; if added it MUST still never silently drop finalized `transcript`.
+
+### 10.2 Start ordering on the control channel (Shell)
+
+`start()` MAY be called as soon as the element is connected — before the control channel has opened or delivered its initial `sync` (the README quick start does this), and immediately after `abort()` / `reset()` of a previous session. The control channel is ordered and the Core emits `recognizing=true` before `start()` returns the session id (step 2 above), so the client-side state at `invoke("start")`'s reply reflects the server **after** that start, while state received before the reply may **predate** it: the initial `sync` snapshot (`recognizing=false`), or the previous session's `recognizing=false`. In relay mode the Shell therefore:
+
+- MUST NOT treat a `recognizing=false` received while its `invoke("start")` is pending as the end of that start's session (no part of the data plane runs before the reply);
+- at the reply, MUST arm the data plane (audio channel + mic) only when the session id is non-empty, the bound `recognizing` is `true`, and the start was not cancelled meanwhile; a session id it will not use MUST be released with `abort`;
+- when the start is cancelled while pending (`stop()` / `abort()` / `reset()` / DOM disconnection), MUST NOT arm the mic and MUST NOT send an extra `abort` (it could hit a newer start's session): the cancelling command, sent after `start` on the ordered channel — or the control channel's close, which the server answers by disposing the Core (§10) — tears the session down. The cancelled start's own rejection (e.g. the proxy's disposal) is not surfaced as `error`.
+
+In local / direct mode the in-page Core's events are never stale, and the Shell arms the mic only if the Core is `recognizing` once its `start()` resolves (a failed start publishes `error` and leaves `recognizing=false` — §17).
+
+Invariant: no start path leaves a server session running with no data plane attached, or a microphone armed with no session.
 
 ## 11. Transport contract
 
@@ -222,7 +236,8 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 - Own DOM lifecycle, attribute/property mapping, and command wiring.
 - Run the mic data plane (`getUserMedia` → `AudioWorklet` → downsample → PCM frame) and stream frames on the binary channel (remote) or into `feedAudio()` (local).
 - Project `level` and `mode`.
-- Forward inputs/commands to the active bind target; never hold recognition authority, the APPKEY, or transport choice.
+- Forward inputs/commands to the active bind target, including inputs set before connect (§7.2); never hold recognition authority, the APPKEY, or transport choice.
+- Arm the data plane only for a session that is live at `start()`'s reply, never on control-channel state that predates it (§10.2).
 - On `disconnectedCallback`: stop capture, release `MediaStream` tracks, close both channels, dispose the proxy, abort the Core.
 
 ## 17. Error contract
@@ -285,5 +300,7 @@ The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each of 
 | Structured logging (§14) | Implemented + tested — injectable `logger` on `createAmiVoiceRelayServer` (open/close, rejected audio, emitted errors; no secrets) |
 | Coverage gate | Implemented — `npm run test:coverage` over the portable logic layer |
 | `@wc-bindable/remote` 0.10 `JsonValue` gate (§7.2, §8, §17) | Implemented + tested — JSON-safe Core `error`, re-normalized `segments`, `null` input reset, Error-only direct-mint rejection; unit suites through the real 0.10 proxies (`__tests__/remoteWire*.test.ts`) + Node integration failure paths (rejected `s`, upstream drop) |
+| Start ordering vs stale control-channel state (§10.2) | Implemented + tested — `start()` before the initial `sync`, `abort()`/`reset()` + immediate `start()`, cancel/disconnect while pending, failed in-page start; unit (real 0.10 proxy), Node integration (the Shell over real sockets), Playwright (`?presync`) |
+| Inputs set before connect (§7.2) | Implemented + tested — replayed to the server Core (relay/direct) and applied to the in-page Core (local/direct) on connect |
 
 Both transports are implemented and verified end to end in Node and a real browser, and the Phase 3 hardening is in place. **Relay**: browser mic data plane → control proxy → Core → provider WSS loop; binary audio over a `Sec-WebSocket-Protocol`-correlated channel → server helper → `feedAudio`. **Direct** (docs/adr/0006): the control proxy mints (one-time APPKEY + approved `s`); the browser opens the AmiVoice WSS itself and streams audio direct, reusing the shared `runRealtimeSession` loop — the permanent APPKEY never leaves the server and the bindable surface is byte-identical. What remains is a real-AmiVoice smoke run (gated behind `AMIVOICE_APPKEY`) and the user-driven release (version bump + `npm publish`). Resolved/remaining tuning decisions are tracked in [docs/implementation-notes.md](docs/implementation-notes.md).

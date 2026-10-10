@@ -263,8 +263,9 @@ export class AmiVoiceCore extends EventTarget {
    * `toError` does it (SPEC §14): in `message`, `stack`, every `cause` in the
    * chain and the extra fields, in place. An `Error` holding it where it
    * cannot be overwritten (a frozen `cause`, a read-only field) is rebuilt
-   * like a frozen one instead, so this never carries an unredacted
-   * `authorization=<APPKEY>`.
+   * like a frozen one instead, so this never carries the APPKEY in a form
+   * `redactSecrets` recognizes (its registered value, `authorization=`,
+   * `Bearer`, `u=`, …) unredacted.
    *
    * It changes together with `error`: set before the Core dispatches
    * `ami-voice:error`, so a listener on the Core (or on its `target`) can read

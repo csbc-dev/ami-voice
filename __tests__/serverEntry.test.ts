@@ -26,6 +26,11 @@ describe("redactSecrets on the /server entry", () => {
     expect("redactSecrets" in browser).toBe(false);
   });
 
+  it("the value registry behind it (registerKnownSecret) is internal: neither entry exports it", () => {
+    expect("registerKnownSecret" in server).toBe(false);
+    expect("registerKnownSecret" in browser).toBe(false);
+  });
+
   it("package.json maps ./server to what tsc emits for src/server.ts", () => {
     const pkg = readJson("package.json");
     expect(pkg.exports["./server"]).toStrictEqual({ types: "./dist/server.d.ts", default: "./dist/server.js" });

@@ -12,6 +12,7 @@ import type {
   IAmiVoiceProvider, IRealtimeSession, RealtimeSessionHandlers, RecognitionSegment, DirectSessionInfo,
 } from "../src/types";
 import { memoryTransportPair, captureConsole, scriptedUpstream, type MemoryTransportPair } from "./support/memoryTransport";
+import { leaksOf } from "./support/reachableStrings";
 
 /**
  * Regression suite for `@wc-bindable/remote` 0.10's strict JsonValue gate, run
@@ -503,6 +504,19 @@ describe("server stack traces stay on the server (wc-bindable-protocol#38)", () 
     expect(err).toMatchObject(MINT_FAILED);
     expect(err.stack).toContain("issueOneTimeAppKey");
   });
+
+  it("the rejection's cause chain and extra fields are APPKEY-redacted like originalError — same instance, stack kept", async () => {
+    const thrown = Object.assign(new Error("mint failed"), {
+      cause: new Error("POST /issue_service_authorization authorization=PERMANENT-APPKEY"),
+      body: "sid=x&authorization=PERMANENT-APPKEY",
+    });
+    const core = new AmiVoiceCore(customDirect(async () => { throw thrown; })(), undefined, { transport: "direct" });
+    const err = await rejectionOf(core.start());
+    expect(err).toBe(thrown);
+    expect(err.stack).toContain("mint failed");
+    expect((err.cause as Error).message).toBe("POST /issue_service_authorization authorization=<redacted>");
+    expect(leaksOf(err, "PERMANENT-APPKEY")).toEqual([]);
+  });
 });
 
 /**
@@ -746,6 +760,88 @@ describe("AmiVoiceCore.originalError — the original exception stays on the ser
     expect(events).toContainEqual({ type: "error", code: "unknown", message: err.message });
     expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
     expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+  });
+
+  /**
+   * A custom provider may put the APPKEY in the cause chain or an extra field
+   * (an `s` command it kept, an upstream frame it quotes). `originalError` goes
+   * to a tracker whole, so it is redacted there too — in place (SPEC §14).
+   */
+  const UPSTREAM = {
+    name: "AmiVoiceError", message: "recognizer send failed", code: "upstream", resultCode: "<", retryable: true,
+  };
+  it.each([
+    [
+      "a multi-level cause chain ending in a non-Error cause, and extra fields",
+      () => {
+        const tail = { detail: "upstream said authorization=PERMANENT-APPKEY", cause: "raw authorization=PERMANENT-APPKEY" };
+        const mid = Object.assign(new Error("connect failed authorization=PERMANENT-APPKEY"), { cause: tail });
+        return Object.assign(new AmiVoiceError("<", "recognizer send failed"), {
+          cause: mid,
+          command: "s LSB16K -a-general authorization=PERMANENT-APPKEY",
+          diag: { requestId: "REQ-7f3a", sent: ["authorization=PERMANENT-APPKEY"] },
+        });
+      },
+    ],
+    [
+      "a cause chain that loops back to the error",
+      () => {
+        const err = new AmiVoiceError("<", "recognizer send failed");
+        const mid = Object.assign(new Error("retry authorization=PERMANENT-APPKEY"), { cause: err });
+        return Object.assign(err, { cause: mid, diag: { owner: err, line: "authorization=PERMANENT-APPKEY" } });
+      },
+    ],
+  ])("the APPKEY in %s is redacted as well — same instance, still off the wire and the log", async (_label, make) => {
+    const con = captureConsole();
+    const events: AmiVoiceServerLogEvent[] = [];
+    const original = make();
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(original), logger: (e) => events.push(e) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const tracked: Error[] = [];
+    ctrl.core.addEventListener("ami-voice:error", () => {
+      if (ctrl.core.originalError) tracked.push(ctrl.core.originalError);
+    });
+    const { proxy, values } = connectClient(pair);
+
+    await expect(proxy.invoke("start")).resolves.toBeNull();
+
+    // What the tracker gets: the provider's own instance, its chain kept, nothing on it holding the APPKEY.
+    expect(tracked).toStrictEqual([original]);
+    expect(tracked[0]).toBe(original);
+    expect(original).toBeInstanceOf(AmiVoiceError);
+    expect((original as AmiVoiceError & { cause: unknown }).cause).toBeInstanceOf(Error);
+    expect(leaksOf(original, "PERMANENT-APPKEY")).toEqual([]);
+    // The browser: the same plain projection as before.
+    expect(values.error).toStrictEqual(UPSTREAM);
+    expect(ctrl.core.error).toStrictEqual(UPSTREAM);
+    const text = pair.wire.join("\n");
+    for (const marker of ["PERMANENT-APPKEY", "REQ-7f3a", "originalError", "\"stack\"", "\"cause\""]) expect(text).not.toContain(marker);
+    expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("a secret it cannot overwrite in place (a frozen cause) makes it a rebuilt Error, still clean", async () => {
+    const con = captureConsole();
+    const original = Object.assign(new AmiVoiceError("<", "recognizer send failed"), {
+      cause: Object.freeze(new Error("connect failed authorization=PERMANENT-APPKEY")),
+    });
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(original) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const { proxy, values } = connectClient(pair);
+
+    await expect(proxy.invoke("start")).resolves.toBeNull();
+
+    const err = ctrl.core.originalError!;
+    expect(err).not.toBe(original);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toMatchObject(UPSTREAM);
+    expect(Object.getOwnPropertyNames(err)).not.toContain("cause");
+    expect(leaksOf(err, "PERMANENT-APPKEY")).toEqual([]);
+    expect(values.error).toStrictEqual(UPSTREAM);
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+    expect(con.wireDrops()).toEqual([]);
   });
 
   it.each([

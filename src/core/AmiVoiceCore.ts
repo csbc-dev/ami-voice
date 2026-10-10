@@ -179,8 +179,8 @@ export class AmiVoiceCore extends EventTarget {
   private _error: SerializedError | null = null;
   /**
    * The exception behind `_error`, shaped by `toError` (an `Error` instance,
-   * APPKEY redacted from `message` / `stack`). Server-side only; see
-   * `originalError`.
+   * APPKEY redacted from `message`, `stack`, the `cause` chain and extra
+   * fields). Server-side only; see `originalError`.
    */
   private _errorSource: Error | null = null;
 
@@ -259,9 +259,12 @@ export class AmiVoiceCore extends EventTarget {
    * instance; a frozen `Error`, a plain `{ message, … }` object or a bare
    * string becomes a new `Error` with the same `name` / `message` / `code` /
    * `resultCode` / `retryable` (a value too hostile to read becomes
-   * `Error("unserializable error value")`). The APPKEY is redacted from
-   * `message` and `stack` exactly as `toError` does it (SPEC §14) — `cause`
-   * and extra fields are left as thrown.
+   * `Error("unserializable error value")`). The APPKEY is redacted exactly as
+   * `toError` does it (SPEC §14): in `message`, `stack`, every `cause` in the
+   * chain and the extra fields, in place. An `Error` holding it where it
+   * cannot be overwritten (a frozen `cause`, a read-only field) is rebuilt
+   * like a frozen one instead, so this never carries an unredacted
+   * `authorization=<APPKEY>`.
    *
    * It changes together with `error`: set before the Core dispatches
    * `ami-voice:error`, so a listener on the Core (or on its `target`) can read

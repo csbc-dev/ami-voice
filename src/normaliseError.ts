@@ -115,6 +115,12 @@ export function toSerializedError(err: unknown): SerializedError | null {
  * cause. Rebuild it as an `Error` that keeps the original `name` / redacted
  * `message` / `code` (the remote shell forwards `code` to the consumer) plus
  * `resultCode` / `retryable` for in-process callers.
+ *
+ * The Core also runs every failure it publishes through this before projecting
+ * it with `toSerializedError`, and keeps the result as the server-side
+ * `AmiVoiceCore.originalError` — so its `message` / `stack` are redacted by the
+ * same rule. It can throw on a hostile value (a throwing `message` getter); the
+ * Core guards that call.
  */
 export function toError(err: unknown): Error {
   const normalised = normaliseError(err);

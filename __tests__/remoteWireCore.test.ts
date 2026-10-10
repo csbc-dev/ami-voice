@@ -504,3 +504,306 @@ describe("server stack traces stay on the server (wc-bindable-protocol#38)", () 
     expect(err.stack).toContain("issueOneTimeAppKey");
   });
 });
+
+/**
+ * `AmiVoiceCore.originalError` — the exception behind `error` (same name and
+ * meaning as s3-uploader's `S3Core.originalError`). It is for server-side
+ * logging / monitoring only: never declared in `wcBindable`, so the REAL 0.10
+ * shell never puts it in a `sync`, an `update` or a `throw`, and refuses it as
+ * a command or an input. Its `message` / `stack` are APPKEY-redacted by `toError`.
+ */
+describe("AmiVoiceCore.originalError — the original exception stays on the server", () => {
+  const DECLARED = AmiVoiceCore.wcBindable.properties.map((p) => p.name);
+  /** What only the instance carries (stack frame, cause, extra field) + the APPKEY. */
+  const INSTANCE_ONLY = ["SERVER_STACK_FRAME", "/srv/app", "ECONNREFUSED", "REQ-7f3a", "PERMANENT-APPKEY"];
+
+  type RichError = AmiVoiceError & { cause: Error; diag: { requestId: string } };
+  /** An auth rejection echoing the APPKEY, with a server stack, a cause and an extra field. */
+  function richError(): RichError {
+    const err = new AmiVoiceError("-", "s LSB16K -a-general authorization=PERMANENT-APPKEY rejected");
+    err.stack = "AmiVoiceError: s LSB16K -a-general authorization=PERMANENT-APPKEY rejected\n"
+      + "    at SERVER_STACK_FRAME (/srv/app/session.js:1:1)";
+    return Object.assign(err, {
+      cause: new Error("connect ECONNREFUSED 10.0.0.5:443"),
+      diag: { requestId: "REQ-7f3a" },
+    });
+  }
+  const PUBLISHED = {
+    name: "AmiVoiceError",
+    message: "s LSB16K -a-general authorization=<redacted> rejected",
+    code: "auth",
+    resultCode: "-",
+    retryable: false,
+  };
+
+  /** Every `sync` / `update` names declared properties only. */
+  function expectDeclaredOnly(frames: Array<Record<string, unknown>>): void {
+    for (const m of frames) {
+      if (m.type === "sync") for (const name of Object.keys(m.values as object)) expect(DECLARED).toContain(name);
+      if (m.type === "update") expect(DECLARED).toContain(m.name);
+    }
+  }
+
+  it("is undeclared: not a wcBindable property, input or command", () => {
+    const { properties, inputs = [], commands = [] } = AmiVoiceCore.wcBindable;
+    expect([...properties, ...inputs, ...commands].map((d) => d.name)).not.toContain("originalError");
+  });
+
+  it("server code reads the instance from the Core's error event; sync / update never carry it", async () => {
+    const con = captureConsole();
+    const original = richError();
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(original) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    // The README recipe: listen on the Core, read the instance there.
+    const seen: Array<{ error: unknown; originalError: Error | null }> = [];
+    ctrl.core.addEventListener("ami-voice:error", () => {
+      seen.push({ error: ctrl.core.error, originalError: ctrl.core.originalError });
+    });
+    const { proxy, values } = connectClient(pair);
+
+    await expect(proxy.invoke("start")).resolves.toBeNull();
+
+    // start() first clears (both null), then publishes — each pair in place at its dispatch.
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toStrictEqual({ error: null, originalError: null });
+    expect(seen[1].error).toStrictEqual(PUBLISHED);
+    expect(seen[1].originalError).toBe(original);
+
+    // Server side: the provider's own instance — class, stack, cause, extra field.
+    const err = ctrl.core.originalError as RichError;
+    expect(err).toBe(original);
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err).toMatchObject({ name: "AmiVoiceError", code: "auth", resultCode: "-", retryable: false });
+    expect(err.stack).toContain("SERVER_STACK_FRAME");
+    expect(err.cause.message).toBe("connect ECONNREFUSED 10.0.0.5:443");
+    expect(err.diag).toStrictEqual({ requestId: "REQ-7f3a" });
+    // …with the APPKEY redacted from message and stack (toError's rule).
+    expect(err.message).toBe(PUBLISHED.message);
+    expect(err.stack).toContain("authorization=<redacted>");
+    expect(err.stack).not.toContain("PERMANENT-APPKEY");
+
+    // Browser side: only the plain projection.
+    expect(values.error).toStrictEqual(PUBLISHED);
+    expect(ctrl.core.error).toStrictEqual(PUBLISHED);
+
+    // The wire: declared names only, `error` exactly the projection, nothing instance-only.
+    const frames = serverFrames(pair);
+    expectDeclaredOnly(frames);
+    expect(frames.filter((m) => m.type === "update" && m.name === "error" && m.value !== null).map((m) => m.value))
+      .toStrictEqual([PUBLISHED]);
+    const text = pair.wire.join("\n");
+    for (const marker of [...INSTANCE_ONLY, "originalError", "\"stack\"", "\"cause\""]) expect(text).not.toContain(marker);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("a client attaching after the failure gets the plain error in sync, never the instance", async () => {
+    const con = captureConsole();
+    const original = richError();
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(original) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    await ctrl.core.start(); // fails server-side before any client is bound
+    expect(ctrl.core.originalError).toBe(original);
+
+    const { values } = connectClient(pair);
+    await vi.waitFor(() => expect(values.error).toStrictEqual(PUBLISHED));
+
+    const sync = serverFrames(pair).find((m) => m.type === "sync")!;
+    expect((sync.values as Record<string, unknown>).error).toStrictEqual(PUBLISHED);
+    expect(sync.getterFailures).toBeUndefined();
+    expectDeclaredOnly([sync]);
+    const text = JSON.stringify(sync);
+    for (const marker of [...INSTANCE_ONLY, "originalError", "\"stack\"", "\"cause\""]) expect(text).not.toContain(marker);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("a command's throw reply never carries it (a session whose abort() throws)", async () => {
+    const con = captureConsole();
+    let handlers: RealtimeSessionHandlers | undefined;
+    const relay = createAmiVoiceRelayServer({
+      createProvider: () => ({
+        openRealtimeSession: async (_o, h) => {
+          handlers = h;
+          return { feedAudio() {}, async stop() {}, abort() { throw new Error("session teardown failed"); } };
+        },
+        recognizeFile: async () => [],
+      }),
+    });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const { proxy, values } = connectClient(pair);
+    await proxy.invoke("start");
+
+    const original = richError();
+    handlers!.onError(original); // a mid-session failure the Core publishes
+    expect(ctrl.core.originalError).toBe(original);
+    await vi.waitFor(() => expect(values.error).toStrictEqual(PUBLISHED));
+
+    const err = await rejectionOf(proxy.invoke("abort"));
+    expect(err.message).toBe("session teardown failed");
+    const thrown = serverFrames(pair).filter((m) => m.type === "throw");
+    expect(thrown.map((m) => m.error)).toStrictEqual([{ name: "Error", message: "session teardown failed" }]);
+    // The throw is not a published failure: `originalError` still names the published one.
+    expect(ctrl.core.originalError).toBe(original);
+    const text = pair.wire.join("\n");
+    for (const marker of [...INSTANCE_ONLY, "originalError"]) expect(text).not.toContain(marker);
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("a hand-written cmd / set naming it is refused as undeclared", async () => {
+    captureConsole();
+    const original = richError();
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(original) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    await ctrl.core.start();
+    connectClient(pair);
+
+    // Raw frames, as a hostile client would send them (the proxy itself refuses locally).
+    pair.client.send({ type: "cmd", name: "originalError", id: "probe-cmd", args: [] });
+    pair.client.send({ type: "set", name: "originalError", value: null, id: "probe-set" });
+
+    const answer = (id: string) => serverFrames(pair).find((m) => m.type === "throw" && m.id === id);
+    await vi.waitFor(() => expect(answer("probe-set")).toBeDefined());
+    expect(answer("probe-cmd")!.error).toMatchObject({ code: "WC_BINDABLE_UNDECLARED_COMMAND" });
+    expect(answer("probe-set")!.error).toMatchObject({ code: "WC_BINDABLE_UNDECLARED_INPUT" });
+    const text = pair.wire.filter((f) => f.startsWith("S:")).join("\n");
+    for (const marker of INSTANCE_ONLY) expect(text).not.toContain(marker);
+    // Nothing was invoked or overwritten.
+    expect(ctrl.core.originalError).toBe(original);
+    expect(ctrl.core.error).toStrictEqual(PUBLISHED);
+  });
+
+  it("follows `error`: replaced by the next failure, null again on recovery (start / reset)", async () => {
+    captureConsole();
+    const upstream = scriptedUpstream();
+    const real = new AmiVoiceProvider({ appKey: "K", socketFactory: upstream.socketFactory });
+    let failNext = true;
+    const relay = createAmiVoiceRelayServer({
+      createProvider: () => ({
+        openRealtimeSession: (o, h) => {
+          if (failNext) { failNext = false; return Promise.reject(new AmiVoiceError("b", "server busy")); }
+          return real.openRealtimeSession(o, h);
+        },
+        recognizeFile: async () => [],
+      }),
+    });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const pairs: Array<[unknown, Error | null]> = [];
+    ctrl.core.addEventListener("ami-voice:error", () => pairs.push([ctrl.core.error, ctrl.core.originalError]));
+    const { proxy, values } = connectClient(pair);
+
+    await proxy.invoke("start");
+    expect(ctrl.core.originalError).toMatchObject({ name: "AmiVoiceError", code: "server-busy", message: "server busy" });
+
+    // Recovery: a successful start clears both.
+    expect(typeof await proxy.invoke("start")).toBe("string");
+    expect(ctrl.core.error).toBeNull();
+    expect(ctrl.core.originalError).toBeNull();
+
+    // An upstream drop mid-session publishes the next failure.
+    upstream.drop();
+    await vi.waitFor(() => expect(values.error).toMatchObject({ code: "upstream" }));
+    expect(ctrl.core.originalError).toBeInstanceOf(AmiVoiceError);
+    expect(ctrl.core.originalError).toMatchObject({ code: "upstream", message: "AmiVoice connection lost mid-session" });
+
+    // reset() clears both.
+    await proxy.invoke("reset");
+    expect(ctrl.core.error).toBeNull();
+    expect(ctrl.core.originalError).toBeNull();
+
+    // Every dispatch saw a consistent pair: null with null, a failure with its source.
+    expect(pairs.length).toBeGreaterThanOrEqual(4);
+    for (const [error, source] of pairs) {
+      if (error === null) expect(source).toBeNull();
+      else expect(error).toStrictEqual(expect.objectContaining({ name: source!.name, message: source!.message }));
+    }
+  });
+
+  it("an APPKEY echoed by a real upstream rejection is redacted in message and stack", async () => {
+    captureConsole();
+    const events: AmiVoiceServerLogEvent[] = [];
+    const upstream = scriptedUpstream({ rejectStart: true });
+    const relay = createAmiVoiceRelayServer({
+      createProvider: () => new AmiVoiceProvider({ appKey: "PERMANENT-APPKEY", socketFactory: upstream.socketFactory }),
+      logger: (e) => events.push(e),
+    });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const { proxy } = connectClient(pair);
+
+    await proxy.invoke("start");
+
+    const err = ctrl.core.originalError!;
+    expect(err).toBeInstanceOf(AmiVoiceError);
+    expect(err.message).toBe("rejected: s LSB16K -a-general authorization=<redacted>");
+    expect(err.stack).toContain("authorization=<redacted>");
+    expect(err.stack).not.toContain("PERMANENT-APPKEY");
+    expect(JSON.stringify(err)).not.toContain("PERMANENT-APPKEY");
+    // The logger record for it stays the minimal projection; nothing leaked anywhere.
+    expect(events).toContainEqual({ type: "error", code: "unknown", message: err.message });
+    expect(JSON.stringify(events)).not.toContain("PERMANENT-APPKEY");
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+  });
+
+  it.each([
+    [
+      "a frozen AmiVoiceError",
+      () => Object.freeze(new AmiVoiceError("-", "denied authorization=PERMANENT-APPKEY")),
+      { name: "AmiVoiceError", message: "denied authorization=<redacted>", code: "auth", resultCode: "-", retryable: false },
+    ],
+    [
+      "a plain object",
+      () => ({ name: "QuotaError", message: "quota for authorization=PERMANENT-APPKEY", code: "busy", retryable: true }),
+      { name: "QuotaError", message: "quota for authorization=<redacted>", code: "busy", retryable: true },
+    ],
+    [
+      "a bare string",
+      () => "socket closed authorization=PERMANENT-APPKEY",
+      { name: "Error", message: "socket closed authorization=<redacted>" },
+    ],
+    [
+      "a hostile value (throwing getter)",
+      () => ({ get message(): string { throw new Error("trap"); } }),
+      { name: "Error", message: "unserializable error value" },
+    ],
+  ])("%s becomes an Error keeping name / message / code / resultCode / retryable", async (_label, make, expected) => {
+    const con = captureConsole();
+    const thrown = make();
+    const relay = createAmiVoiceRelayServer({ createProvider: () => failingProvider(thrown) });
+    const pair = memoryTransportPair();
+    const ctrl = relay.handleControlConnection(pair.server);
+    const { proxy, values } = connectClient(pair);
+
+    await expect(proxy.invoke("start")).resolves.toBeNull(); // still publish, never reject
+
+    const err = ctrl.core.originalError!;
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBe(thrown);
+    expect(err).toMatchObject(expected);
+    for (const key of ["code", "resultCode", "retryable"] as const) {
+      if (!(key in expected)) expect(err).not.toHaveProperty(key);
+    }
+    expect(err.message).not.toContain("PERMANENT-APPKEY");
+    expect(err.stack ?? "").not.toContain("PERMANENT-APPKEY");
+    // The wire projection is unchanged: exactly the same fields.
+    expect(ctrl.core.error).toStrictEqual(expected);
+    expect(values.error).toStrictEqual(expected);
+    expect(pair.wire.join("\n")).not.toContain("PERMANENT-APPKEY");
+    expect(con.wireDrops()).toEqual([]);
+  });
+
+  it("direct mode: a mint failure rejects instead of publishing — originalError stays null, the logger has it", async () => {
+    const thrown = new Error("mint failed");
+    thrown.stack = "Error: mint failed\n    at SERVER_STACK_FRAME (/srv/app/mint.js:1:1)";
+    const { proxy, ctrl, events } = directSetup(customDirect(async () => { throw thrown; }));
+
+    await rejectionOf(proxy.invoke("start"));
+
+    expect(ctrl.core.error).toBeNull();
+    expect(ctrl.core.originalError).toBeNull();
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: "mint failed", stack: thrown.stack });
+  });
+});

@@ -177,6 +177,12 @@ export class AmiVoiceCore extends EventTarget {
    * `toSerializedError`.
    */
   private _error: SerializedError | null = null;
+  /**
+   * The exception behind `_error`, shaped by `toError` (an `Error` instance,
+   * APPKEY redacted from `message` / `stack`). Server-side only; see
+   * `originalError`.
+   */
+  private _errorSource: Error | null = null;
 
   /**
    * @param provider APPKEY-bearing AmiVoice access.
@@ -242,6 +248,44 @@ export class AmiVoiceCore extends EventTarget {
   get loading(): boolean { return this._loading; }
   get error(): SerializedError | null { return this._error; }
 
+  /**
+   * The exception behind `error`, for server-side logging and monitoring
+   * (an error tracker's `captureException`, …). `error` is only the plain
+   * `{ name, message, code?, resultCode?, retryable? }` that crosses the wire;
+   * this is the `Error` it was projected from, as the Core caught it from the
+   * provider / the session — class, `stack`, `cause` and extra fields kept.
+   *
+   * It is the caught value passed through `toError`: an `Error` is the same
+   * instance; a frozen `Error`, a plain `{ message, … }` object or a bare
+   * string becomes a new `Error` with the same `name` / `message` / `code` /
+   * `resultCode` / `retryable` (a value too hostile to read becomes
+   * `Error("unserializable error value")`). The APPKEY is redacted from
+   * `message` and `stack` exactly as `toError` does it (SPEC §14) — `cause`
+   * and extra fields are left as thrown.
+   *
+   * It changes together with `error`: set before the Core dispatches
+   * `ami-voice:error`, so a listener on the Core (or on its `target`) can read
+   * it, and `null` exactly when `error` is `null`:
+   *
+   * ```ts
+   * core.addEventListener("ami-voice:error", () => {
+   *   if (core.originalError) tracker.captureException(core.originalError);
+   * });
+   * ```
+   *
+   * Only failures the Core publishes on `error` appear here. A command that
+   * rejects instead — a direct-mode mint failure (SPEC §11.4), anything the
+   * remote shell answers with a `throw` — leaves it untouched; the server
+   * helper's `logger` records those.
+   *
+   * Deliberately NOT declared in `wcBindable`: `RemoteShellProxy` reads,
+   * forwards and accepts only declared names, so this value never reaches a
+   * `sync`, an `update` or a command, and the browser keeps receiving the
+   * plain `error` (SPEC §17: no server stack or cause on the wire). Returned
+   * as-is, not copied.
+   */
+  get originalError(): Error | null { return this._errorSource; }
+
   private _setRecognizing(v: boolean): void { if (this._recognizing !== v) { this._recognizing = v; this._emit("recognizing", v); } }
   private _setConnected(v: boolean): void { if (this._connected !== v) { this._connected = v; this._emit("connected", v); } }
   private _setTranscript(v: string): void { if (this._transcript !== v) { this._transcript = v; this._emit("transcript", v); } }
@@ -251,12 +295,29 @@ export class AmiVoiceCore extends EventTarget {
   private _setConfidence(v: number): void { if (this._confidence !== v) { this._confidence = v; this._emit("confidence", v); } }
   private _setLoading(v: boolean): void { if (this._loading !== v) { this._loading = v; this._emit("loading", v); } }
   /**
-   * Publish a failure (or `null` to clear). Every thrown value is shaped by
-   * `toSerializedError` HERE, so the getter and the emitted detail are the same
-   * JSON-safe, redacted object — the one choke-point for what crosses the wire.
+   * Publish a failure (or `null` to clear). Every thrown value is shaped HERE:
+   * first into the server-side `Error` (`toError`, kept as `originalError`),
+   * then into its wire projection (`toSerializedError`), so the getter and the
+   * emitted detail are the same JSON-safe, redacted object — the one
+   * choke-point for what crosses the wire. Both are assigned before the
+   * dispatch, so an `ami-voice:error` listener reads the pair that belongs to
+   * its event.
    */
   private _setError(err: unknown): void {
-    const v = toSerializedError(err);
+    let source: Error | null = null;
+    if (err != null) {
+      try {
+        source = toError(err);
+      } catch {
+        // A hostile value (throwing getter / `toString`) must not turn the
+        // Core's "publish to `error`, never reject" path (SPEC §17) into a
+        // throw — nor reach a server log unredacted. Same text as
+        // `toSerializedError`'s fallback.
+        source = new Error("unserializable error value");
+      }
+    }
+    this._errorSource = source;
+    const v = toSerializedError(source);
     this._error = v;
     this._emit("error", v);
   }

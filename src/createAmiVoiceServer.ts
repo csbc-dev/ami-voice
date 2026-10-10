@@ -42,7 +42,10 @@ import {
  * remote `throw` the shell answers a browser call with (e.g. a direct-mode mint
  * failure). For the latter, `stack` holds the server-side stack trace and
  * `cause` the (JSON-serialized, redacted) cause chain that the helper withheld
- * from the browser (SPEC §17).
+ * from the browser (SPEC §17). For the former, the record is only the
+ * published `code` + `message`; the exception itself (class, `stack`, `cause`)
+ * is `AmiVoiceCore.originalError`, read from an `ami-voice:error` listener on
+ * `AmiVoiceControlSession.core` (SPEC §14).
  */
 export type AmiVoiceServerLogEvent =
   | { type: "control-open"; transport: AmiVoiceTransport; peerAddress?: string }
@@ -227,7 +230,8 @@ export function createAmiVoiceRelayServer(
       const shell = new RemoteShellProxy(core, withoutThrowInternals(transport, onThrow));
       // Log emitted Core errors (normalized code + message only — never payloads).
       // The detail is the Core's JSON-safe `SerializedError` — the same object the
-      // shell forwards to the browser as the `error` update (SPEC §17).
+      // shell forwards to the browser as the `error` update (SPEC §17). The
+      // exception behind it stays on `core.originalError` for the integrator.
       const onCoreError = (e: Event): void => {
         const detail = (e as CustomEvent<SerializedError | null>).detail;
         if (detail) log({ type: "error", code: getErrorCode(detail), message: redactSecrets(detail.message) });

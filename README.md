@@ -81,7 +81,7 @@ Because the `@wc-bindable/remote` control wire is JSON-only, audio cannot ride i
 This package targets `@wc-bindable/core` / `@wc-bindable/remote` `^0.10.0`. Since 0.10 the control channel validates every value as a `JsonValue` in **both** directions: `undefined`, `NaN` / `±Infinity`, `Date`, `Map`, class instances (`Error` included) and objects with an `undefined` member are **rejected, not coerced**. What that means here:
 
 - **Inputs.** Assigning `undefined` or `null` to an input — `el.engine = undefined` is what React 19 does when you remove a prop — **resets it to its default** (`engine` → `-a-general`, `codec` → `LSB16K`, strings → `""`, booleans → `false`, `resultUpdatedInterval` → `0`); the element forwards it as `null`, and treats `NaN` the same way. An empty string resets `engine` and `codec` too (`engine=""`, `el.codec = ""`) — neither has a valid empty value. Any other non-JSON value (a `Date`, a reactive proxy, …) fails the write with an `ami-voice:error` whose `code` is `WC_BINDABLE_INVALID_JSON_VALUE` — convert it first (Vue `toRaw()`, MobX `toJS()`, `structuredClone`).
-- **`error`.** The Core publishes errors as a plain object `{ name, message, code?, resultCode?, retryable? }` — the same shape locally and in relay/direct mode — so a relay client now sees start failures and upstream drops (e.g. `code: "auth"`, `"upstream"`), and `getErrorCode(el.error)` works everywhere. Errors the element raises itself (codec rejection, microphone denied, a failed control call) are `Error` instances: read `name` / `message` / `code`, don't rely on `instanceof`.
+- **`error`.** The Core publishes errors as a plain object `{ name, message, code?, resultCode?, retryable? }` — the same shape locally and in relay/direct mode — so a relay client now sees start failures and upstream drops (e.g. `code: "auth"`, `"upstream"`), and `getErrorCode(el.error)` works everywhere. The exception behind it stays on the server as [`core.originalError`](#the-original-exception-coreoriginalerror). Errors the element raises itself (codec rejection, microphone denied, a failed control call) are `Error` instances: read `name` / `message` / `code`, don't rely on `instanceof`.
 - **Custom providers.** Finalized segments from a custom `IAmiVoiceProvider` are re-normalized by the Core to the public `RecognitionSegment` shape (unknown keys dropped, `NaN` → `0`, `undefined` members omitted). A custom `prepareDirectSession` must resolve `{ endpoint, sCommand }` as non-empty strings. The Core forwards exactly those two fields to the browser (any other key is dropped — a `Date` or an `undefined` member no longer fails the reply as `WC_BINDABLE_INVALID_RETURN_VALUE`); if either is missing, not a string, or empty, `start` fails with an `invalid-param` error naming the field and its type.
 - **Upgrade server and browser together.** The producer side decides what crosses the wire; run the same `@csbc-dev/ami-voice` release on the server and in the bundle.
 
@@ -122,7 +122,7 @@ The recognition surface (`transcript` / `interim` / `start` / …) is **byte-ide
   3. **Bind audio to the authenticated session** — the audio token rides `Sec-WebSocket-Protocol` (never a query string); ensure the audio peer is the same principal as the control peer.
   4. **Rate-limit & bound resources** — cap message rate, `JsonValue` payload sizes, and concurrent sessions per principal.
   5. **Direct mode** — pass `peerAddress` so the one-time key is `ipa`-restricted, and validate the mint request (Core authority is advisory in direct mode).
-  6. **Observe** — wire the injectable `logger` (below) to your log pipeline.
+  6. **Observe** — wire the injectable `logger` (below) to your log pipeline; read `core.originalError` for the exception behind a published error.
 
 The runnable [examples/relayServer.mjs](examples/relayServer.mjs) marks each as an `authenticatePeer` / `authorize` seam.
 
@@ -141,6 +141,26 @@ createAmiVoiceRelayServer({
   //      { type: "error", code: "auth", message, stack, cause }   // a failed call (stack / cause withheld from the browser)
 });
 ```
+
+### The original exception: `core.originalError`
+
+The log record for an error the Core publishes is just its `code` + `message`. For the exception itself — class, `stack`, `cause`, e.g. to hand to an error tracker — read **`core.originalError`** on the server. The browser never receives it: it gets the plain `error` object only.
+
+```js
+const relay = createAmiVoiceRelayServer({ logger });   // routine records → your log pipeline
+wss.on("connection", (sock) => {
+  const { core } = relay.handleControlConnection(new WebSocketServerTransport(sock));
+  core.addEventListener("ami-voice:error", () => {
+    if (core.originalError) tracker.captureException(core.originalError);   // the exception → your tracker
+  });
+});
+```
+
+- It changes together with `error`: it is set before the Core dispatches `ami-voice:error`, and it is `null` whenever `error` is.
+- It is what the Core caught from the provider / session, passed through the same normalization as a direct-mode rejection: an `Error` stays the same instance; a frozen `Error`, a plain object or a string becomes an `Error` with the same `name` / `message` / `code` / `resultCode` / `retryable`.
+- An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted in `message` and `stack`. `cause` and extra fields are left as thrown — the package's own errors never put the APPKEY there; if your custom provider might, redact before logging.
+- It covers only failures published on `error`. A call that fails instead — a direct-mode mint failure, any other failed call — does not set it; that one is in the `logger`'s `error` record, with `stack` and `cause`.
+- It is **not** declared in `AmiVoiceCore.wcBindable`. `@wc-bindable/remote` sends and accepts only declared names, so it never crosses the control channel and a client cannot invoke or set it.
 
 ## Package entry points
 

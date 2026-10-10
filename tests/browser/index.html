@@ -54,11 +54,18 @@
       out("error").textContent = d ? String(d.message || d) : "";
     });
 
-    document.body.appendChild(av); // connectedCallback → opens the control channel
+    // `?presync`: connect the element and call start() in the same task — the
+    // README quick-start shape — so start() runs before the control channel has
+    // even opened, i.e. before its initial `sync` (SPEC §10.2).
+    const presync = new URLSearchParams(location.search).has("presync");
+    if (!presync) document.body.appendChild(av); // connectedCallback → opens the control channel
 
     // start()/stop() are called from a real click so getUserMedia + AudioContext
     // get a user gesture (Chromium fake device supplies the audio).
-    out("start").addEventListener("click", () => { void av.start(); });
+    out("start").addEventListener("click", () => {
+      if (!av.isConnected) document.body.appendChild(av);
+      void av.start();
+    });
     out("stop").addEventListener("click", () => { void av.stop(); });
 
     // Expose for direct driving from page.evaluate if needed.

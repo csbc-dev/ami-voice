@@ -48,6 +48,8 @@ The server wires `@csbc-dev/ami-voice/server`'s `createAmiVoiceRelayServer` to y
 </script>
 ```
 
+`start()` can be called as soon as the element is in the DOM — there is no need to wait for the control channel to connect: the element arms the microphone for the session the server reports live in `start()`'s own reply ([SPEC.md §10.2](SPEC.md)). Inputs set before that — attributes like `engine` / `codec` above, or properties — are applied to the Core when the element connects, in every mode. In a real page, call `start()` from a user gesture (e.g. a click handler): browsers gate the microphone and audio processing behind one.
+
 Any framework adapter from the `@wc-bindable/*` family (React, Vue, Svelte, …) binds the same reactive state — see the [wc-bindable adapters](https://github.com/wc-bindable-protocol/wc-bindable-protocol#packages).
 
 ## Reactive surface

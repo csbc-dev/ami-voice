@@ -62,7 +62,10 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 /**
  * Run one realtime session over `socket`, sending `startCommand` on open and
  * resolving with an `IRealtimeSession` once AmiVoice acks `s`. Failures before
- * the ack reject; failures after it go to `handlers.onError`.
+ * the ack reject; failures after it go to `handlers.onError`. A socket that
+ * throws never throws out of the loop: a failed `s` send rejects the start, a
+ * failed audio send ends the session (`onError`, then `onClose`, once), and a
+ * close() that throws is swallowed everywhere but in `abort()`.
  *
  * @param socket           already-constructed transport (server WSS or browser WSS).
  * @param startCommand     the fully built `s` command (APPKEY / one-time token baked in).
@@ -89,6 +92,16 @@ export function runRealtimeSession(
   // Set by stop()/abort() so a teardown WE initiated is not misreported as an
   // upstream drop (Phase 3.1 / implementation-notes Q3).
   let intentionalClose = false;
+  // Set once the session's end has been reported (`handlers.onClose`): by the
+  // socket's close, or by a failed audio send, which ends the session itself
+  // (see `failSession`). The end is reported once; nothing the socket delivers
+  // after it (a late close, error or event) is reported.
+  let closeReported = false;
+  // Set once the loop has let go of the socket: `abort()`, a settled graceful
+  // stop, or a failed audio send. A frame fed after that is dropped rather than
+  // sent: the socket is closed or closing, and a send that throws there must
+  // not fail a session the consumer already left (SPEC §10.1, §18).
+  let released = false;
   let onEAck: (() => void) | null = null;
   // Set while a graceful stop() is in flight so an `onclose` that arrives before
   // the `e` ack (the common server-initiated-close-after-`e` shutdown) settles
@@ -103,11 +116,38 @@ export function runRealtimeSession(
   // timer (the up-to-stopTimeoutMs delay the onSocketClosed hook exists to avoid).
   let stopping: Promise<void> | null = null;
 
+  // `RealtimeSocket` is an injectable seam (tests/custom transports), and the
+  // loop closes the socket from places a throw must not escape: a socket event
+  // handler (`onopen`, the `e` ack, `onclose`), a timer (the connect deadline,
+  // the graceful stop's fallback) and `feedAudio` (the audio channel's message
+  // listener, the mic's frame callback). Every such close is quiet; only
+  // `abort()`, a direct call by the consumer, still closes the socket as is.
+  const closeQuietly = (): void => { try { socket.close(); } catch { /* already settling */ } };
+
+  // A `p` frame whose send threw: the session cannot go on. `feedAudio` runs
+  // from the relay audio channel's message listener (the server's `ws`
+  // dispatch) and from the mic's frame callback (local / direct), so a throw
+  // left there reached the platform's uncaught-exception reporting — in relay
+  // the server PROCESS (`uncaughtException`: Node exits), unredacted — while
+  // the session stayed `recognizing` with its upstream socket open. End it
+  // instead, once: report the thrown value AS IS through `onError` (like the
+  // `s` command's send in `onopen`: the Core's `toError` is the choke-point
+  // that redacts it, SPEC §14 / §17) and the session's end through `onClose`,
+  // without waiting for the socket's close, which a custom socket may never
+  // report (the Core then tears down: `recognizing` / `connected` = false).
+  // Both flags are set BEFORE the close, so the close it triggers (now or
+  // later) is not reported a second time, nor as an upstream drop. An
+  // in-flight graceful stop settles with it (`onSocketClosed`).
+  const failSession = (err: unknown): void => {
+    released = true;
+    closeReported = true;
+    closeQuietly();
+    handlers.onError(err);
+    handlers.onClose();
+    onSocketClosed?.();
+  };
+
   const ready = new Promise<void>((resolve, reject) => {
-    // `RealtimeSocket` is an injectable seam (tests/custom transports); a close()
-    // that throws after we have already rejected must not escape as an unhandled
-    // exception. Guard every reject-path close, mirroring stop()'s send() guard.
-    const closeQuietly = (): void => { try { socket.close(); } catch { /* already settling */ } };
     // Bound the handshake: if the `s` ack never arrives (and the socket neither
     // closes nor errors — a half-open/black-holed upstream), reject so start()
     // does not hang with `loading` stuck true forever.
@@ -119,6 +159,18 @@ export function runRealtimeSession(
     }, connectTimeoutMs);
     const clearConnectTimer = (): void => { clearTimeout(connectTimer); };
     socket.onopen = () => {
+      // An `open` reported after the handshake already settled — the connect
+      // deadline fired while the socket was still connecting, or it errored or
+      // closed first — comes from a socket the loop has abandoned, whose close()
+      // did not take (a custom socket's no-op close). Sending it `startCommand`
+      // would hand the APPKEY (the one-time APPKEY in direct mode) to a session
+      // nobody drives (SPEC §14). Send nothing and close it again. A second
+      // `open` on a live session is ignored as well: `s` is not re-sent and the
+      // session is not closed.
+      if (settled) {
+        if (!started) closeQuietly();
+        return;
+      }
       // `startCommand` carries the APPKEY (`authorization=`; the one-time APPKEY
       // in direct mode), and a socket can quote what it failed to send in its
       // exception (message, stack, cause). This handler runs from the socket's
@@ -145,6 +197,9 @@ export function runRealtimeSession(
     socket.onclose = () => {
       clearConnectTimer();
       if (!started) { if (!settled) { settled = true; reject(new AmiVoiceError("!", "AmiVoice connection closed before start")); } return; }
+      // A failed audio send already ended the session and reported it.
+      if (closeReported) return;
+      closeReported = true;
       // After the session is up, a close we did NOT initiate is an upstream drop
       // mid-stream. AmiVoice has no resume (implementation-notes Q3), so v1 policy
       // is: surface it as an `error` + `connected=false` and require an explicit
@@ -162,7 +217,7 @@ export function runRealtimeSession(
     socket.onerror = (err) => {
       const e = err instanceof Error ? err : new AmiVoiceError("!", "AmiVoice socket error");
       if (!started) { if (!settled) { settled = true; clearConnectTimer(); reject(e); } }
-      else handlers.onError(e);
+      else if (!closeReported) handlers.onError(e);
     };
     socket.onmessage = (raw) => {
       const ev = parseEvent(raw);
@@ -191,6 +246,8 @@ export function runRealtimeSession(
         }
         return;
       }
+      // The session has ended (a socket that still delivers after a failed audio send).
+      if (closeReported) return;
       switch (ev.type) {
         case "S": handlers.onSegmentStart(ev.ms); break;
         case "E": handlers.onSegmentEnd(ev.ms); break;
@@ -218,16 +275,27 @@ export function runRealtimeSession(
 
   return ready.then((): IRealtimeSession => ({
     feedAudio: (bytes: Uint8Array): void => {
+      // The session is over (a failed send, a close, `abort()`, a settled stop):
+      // nothing more is sent on its socket.
+      if (released || closeReported) return;
       // 'p' command byte + raw audio, sent as one binary frame.
       const frame = new Uint8Array(bytes.length + 1);
       frame[0] = AUDIO_FRAME_BYTE;
       frame.set(bytes, 1);
-      socket.send(frame);
+      try {
+        socket.send(frame);
+      } catch (err) {
+        failSession(err); // never escapes to the audio channel / the mic callback (SPEC §17)
+      }
     },
     stop: (): Promise<void> => {
       // Idempotent: a second in-flight stop() joins the first rather than
       // re-arming the single-slot hooks/timer (which would orphan the first).
       if (stopping) return stopping;
+      // Let go of already (a failed audio send, `abort()`): nothing to flush and
+      // no `e` ack will come — settle at once instead of sending `e` to a
+      // closed socket and waiting out the fallback timer.
+      if (released) return Promise.resolve();
       stopping = new Promise<void>((resolve) => {
         let done = false;
         // A graceful stop is consumer-initiated teardown: mark it before the `e`
@@ -237,9 +305,16 @@ export function runRealtimeSession(
         const finish = (): void => {
           if (done) return;
           done = true;
+          released = true;
           clearTimeout(timer);
           onSocketClosed = null;
-          socket.close();
+          // Quiet: `finish` runs from the `e` ack (`onmessage`), the socket's
+          // close (`onclose`) or the fallback timer. A close() that threw there
+          // escaped from that event / timer as an uncaught exception and, with
+          // `done` set and the timer cleared, left this stop() unresolved for
+          // good: the Core stayed `recognizing` and refused every later start
+          // (SPEC §18). The stop always settles.
+          closeQuietly();
           resolve();
         };
         onEAck = finish; // settle when AmiVoice acks `e` (end-of-results, D1)
@@ -260,6 +335,13 @@ export function runRealtimeSession(
       });
       return stopping;
     },
-    abort: (): void => { intentionalClose = true; socket.close(); },
+    abort: (): void => {
+      // Already let go of (a failed audio send, a settled stop, a previous
+      // abort): the socket was closed — do not close it again.
+      if (released) return;
+      intentionalClose = true;
+      released = true;
+      socket.close();
+    },
   }));
 }

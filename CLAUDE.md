@@ -215,7 +215,7 @@ src/
 |- processEnv.ts            ← reads AMIVOICE_REMOTE_CORE_URL / AMIVOICE_APPKEY from env
 |- types.ts                 ← IAmiVoiceProvider, recognition options, normalized result types
 |- raiseError.ts            ← consistent error-dispatch helper for the Shell
-|- normaliseError.ts        ← error shaping (applies redact.ts): toSerializedError = the Core's JSON-safe published `error`; normaliseError = Shell-side errors; toError = direct-mode rejection (always an Error)
+|- normaliseError.ts        ← error shaping (applies redact.ts): toSerializedError = the Core's JSON-safe published `error`; normaliseError = Shell-side errors; toError = direct-mode rejection + the Core's server-side `originalError` (always an Error)
 |- redact.ts                ← redactSecrets: strips authorization=<APPKEY> before logging / crossing to the browser; choke-point used by normaliseError + server logger
 |- errorCodes.ts            ← AmiVoice result-code → normalized AmiVoiceErrorCode union (+ retryable)
 |- speakerView.ts           ← derived final-only speaker view (toSpeakerSegment; ADR 0007)
@@ -263,6 +263,10 @@ When adding server-safe helpers, mirror the export in both `src/index.ts` and `s
 - **No server stack or cause on the wire.** `createAmiVoiceRelayServer` strips `stack` and the whole `cause` chain from every `throw` envelope at the transport (`withoutThrowInternals`), and logs the redacted originals instead. Do not move this into `toError` / the Core: in-process and local-mode errors keep their stack. Do not remove it until upstream wc-bindable-protocol#38 is fixed (SPEC §17).
 - **`engine` / `codec` reset on `""`** as well as on `null` / `undefined`, because they are positional `s` tokens (SPEC §7.2). Other inputs store `""` as given. Don't widen this to booleans: `noLog=""` is ambiguous.
 - **The Core re-shapes the direct-session result** (`toDirectSessionInfo`) to exactly `{ endpoint, sCommand }`. A malformed result rejects with `invalid-param`, naming only the field and its type. Never echo values: `sCommand` carries the one-time APPKEY.
+- **`AmiVoiceCore.originalError` is server-only; never declare it in `wcBindable`.** It is the `toError`-shaped exception behind the published `error`: the same instance for an `Error`, with the APPKEY redacted from `message` / `stack` and `cause` left as thrown. It is assigned in `_setError` before `ami-voice:error` is dispatched, and is `null` exactly when `error` is.
+  - Declaring it would push the server stack / cause to every client via `sync` / `update` (SPEC §14, §17).
+  - It covers only published failures. Rejections (direct mint, any remote `throw`) go to the helper's `logger`.
+  - Pinned by `AmiVoiceCore.originalError — …` in `__tests__/remoteWireCore.test.ts`. Same name and meaning as `S3Core.originalError`.
 - **Configure once, before connect.** `bootstrapAmiVoice()` / `setConfig()` runs once before any element is connected. Re-configuring after connect leaves already-connected elements on cached settings — undefined behavior.
 - **Clean teardown on disconnect.** On `disconnectedCallback`, stop the `AudioWorklet`, release the `MediaStream` tracks, close both channels, and abort the Core session (an abort-equivalent teardown — no graceful `e` flush; SPEC §18). Leaking a live mic or an open WSS after the element is gone is a bug.
 

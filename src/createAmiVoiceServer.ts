@@ -122,7 +122,8 @@ function toUint8(data: unknown): Uint8Array | null {
  * Copy of a serialized remote error without `stack` and without `cause`. Only
  * `name`, `message` and `code` reach the browser: a cause chain carries the
  * server's internals (`connect ECONNREFUSED 10.0.0.5:443`, downstream error
- * payloads, a custom provider's diagnostics) that `toError` never redacts.
+ * payloads, a custom provider's diagnostics); `toError` redacts only the APPKEY
+ * from it.
  */
 function forTheBrowser(error: unknown): unknown {
   if (typeof error !== "object" || error === null || Array.isArray(error)) return error;

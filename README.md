@@ -158,16 +158,29 @@ wss.on("connection", (sock) => {
 
 - It changes together with `error`: it is set before the Core dispatches `ami-voice:error`, and it is `null` whenever `error` is.
 - It is what the Core caught from the provider / session, passed through the same normalization as a direct-mode rejection: an `Error` stays the same instance; a frozen `Error`, a plain object or a string becomes an `Error` with the same `name` / `message` / `code` / `resultCode` / `retryable`.
-- An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted in `message` and `stack`. `cause` and extra fields are left as thrown — the package's own errors never put the APPKEY there; if your custom provider might, redact before logging.
+- An APPKEY echoed into the failure (e.g. a rejected `s` command) is redacted from the whole instance — `message`, `stack`, every `cause` in the chain and the extra fields (and the objects / arrays under them) — so you can hand it to a tracker as it is. The `Error`s are redacted in place (same instance, class, `stack` and chain); a plain object holding the APPKEY is swapped for a redacted copy rather than edited, since it may be your provider's own state. If the APPKEY sits where it cannot be overwritten (a frozen `cause`, a read-only field), you get a new `Error` like the frozen case above, without `cause`. Redaction recognizes the `authorization=<token>` form only and does not look inside class instances other than `Error` — a custom provider should not put the APPKEY anywhere else.
 - It covers only failures published on `error`. A call that fails instead — a direct-mode mint failure, any other failed call — does not set it; that one is in the `logger`'s `error` record, with `stack` and `cause`.
 - It is **not** declared in `AmiVoiceCore.wcBindable`. `@wc-bindable/remote` sends and accepts only declared names, so it never crosses the control channel and a client cannot invoke or set it.
+
+### Redacting your own logs: `redactSecrets`
+
+The rule the package applies to every error and log record is exported from the server entry, for the strings you log yourself — your custom provider's diagnostics, a wrapper around the `logger`, anything that may quote an `s` command or its echo:
+
+```js
+import { redactSecrets } from "@csbc-dev/ami-voice/server";
+
+redactSecrets("s LSB16K -a-general authorization=XXXXXXXX");
+// → "s LSB16K -a-general authorization=<redacted>"
+```
+
+It replaces every `authorization=<token>` (case-insensitive, up to the next whitespace) and leaves an already redacted string unchanged. It does not know the APPKEY value itself, so a key in any other form passes through. It is server-only: the browser entry (`@csbc-dev/ami-voice`) does not export it.
 
 ## Package entry points
 
 | Import | Environment | Exports |
 |---|---|---|
 | `@csbc-dev/ami-voice` | browser | `bootstrapAmiVoice`, `WcsAmiVoice`, `AmiVoiceCore`, helpers, types |
-| `@csbc-dev/ami-voice/server` | Node | `createAmiVoiceRelayServer`, `AmiVoiceCore`, `AmiVoiceProvider`, error helpers — no `HTMLElement` code |
+| `@csbc-dev/ami-voice/server` | Node | `createAmiVoiceRelayServer`, `AmiVoiceCore`, `AmiVoiceProvider`, error helpers, `redactSecrets` — no `HTMLElement` code |
 | `@csbc-dev/ami-voice/auto` | browser (side-effect) | registers `<ami-voice>` with defaults |
 | `@csbc-dev/ami-voice/auto/remoteEnv` | browser (side-effect) | remote-first; reads `AMIVOICE_REMOTE_CORE_URL` |
 

@@ -1,19 +1,41 @@
 import type { WcsAmiVoiceAnyError, SerializedError } from "./types.js";
-import { redactSecrets } from "./redact.js";
+import { redactSecrets, redactErrorInPlace } from "./redact.js";
 
 /**
  * Copy the JSON-safe error metadata an `AmiVoiceError` (or a remote-revived
  * `Error` / a plain object) carries — `code`, `resultCode`, `retryable` — onto
  * `out`, OMITTING absent keys. Never assigns `undefined`: an `undefined` member
  * makes the whole value a non-JsonValue, which `@wc-bindable/remote` ≥ 0.10
- * refuses to send.
+ * refuses to send. The strings are redacted like `message`: a custom provider
+ * owns these fields, and they cross the wire.
  */
 function copyErrorMeta(src: object, out: SerializedError): SerializedError {
   const e = src as Record<string, unknown>;
-  if (typeof e.code === "string") out.code = e.code;
-  if (typeof e.resultCode === "string") out.resultCode = e.resultCode;
+  if (typeof e.code === "string") out.code = redactSecrets(e.code);
+  if (typeof e.resultCode === "string") out.resultCode = redactSecrets(e.resultCode);
   if (typeof e.retryable === "boolean") out.retryable = e.retryable;
   return out;
+}
+
+/** A redacted `name`, or `"Error"` when it is not a string. */
+function nameOf(e: Record<string, unknown>): string {
+  return typeof e.name === "string" ? redactSecrets(e.name) : "Error";
+}
+
+/**
+ * The redacted `{ name, message, stack?, code?, resultCode?, retryable? }` of
+ * an `Error` that cannot be handed on as it is — frozen, or holding a secret
+ * where `redactErrorInPlace` cannot overwrite it. An absent `stack` is omitted
+ * (not `undefined`) so the shape stays JSON-safe. `cause` and other fields are
+ * not carried.
+ */
+function snapshotOf(err: Error): SerializedError {
+  const out: SerializedError = {
+    name: nameOf(err as unknown as Record<string, unknown>),
+    message: redactSecrets(String(err.message)),
+  };
+  if (typeof err.stack === "string") out.stack = redactSecrets(err.stack);
+  return copyErrorMeta(err, out);
 }
 
 /**
@@ -25,7 +47,8 @@ function copyErrorMeta(src: object, out: SerializedError): SerializedError {
  *
  *   - `null` / `undefined` collapses to `null`
  *   - a real `Error` instance is returned as-is (with any `authorization=…`
- *     scrubbed from its `message` / `stack`)
+ *     scrubbed from its `message` / `stack`; `toError` also scrubs its `cause`
+ *     chain and extra fields)
  *   - a plain object with a `message` field is coerced to `SerializedError`
  *   - everything else is wrapped as `new Error(String(err))`
  *
@@ -49,17 +72,14 @@ export function normaliseError(err: unknown): WcsAmiVoiceAnyError {
       // A frozen / read-only Error (e.g. a hardened or cross-realm Error from a
       // custom provider) cannot be mutated under strict mode. Fall back to a
       // plain SerializedError so redaction still happens and never escapes as an
-      // uncaught TypeError. `code`/`resultCode`/`retryable` are carried over; an
-      // absent `stack` is omitted (not `undefined`) so the shape stays JSON-safe.
-      const out: SerializedError = { name: err.name, message };
-      if (typeof stack === "string") out.stack = stack;
-      return copyErrorMeta(err, out);
+      // uncaught TypeError. `code`/`resultCode`/`retryable` are carried over.
+      return snapshotOf(err);
     }
   }
   if (typeof err === "object" && err !== null && "message" in (err as Record<string, unknown>)) {
     const e = err as Record<string, unknown>;
     const out: SerializedError = {
-      name: typeof e.name === "string" ? e.name : "Error",
+      name: nameOf(e),
       message: redactSecrets(String(e.message ?? "")),
     };
     if (typeof e.stack === "string") out.stack = redactSecrets(e.stack);
@@ -92,7 +112,7 @@ export function toSerializedError(err: unknown): SerializedError | null {
     if (err instanceof Error || (typeof err === "object" && "message" in err)) {
       const e = err as Record<string, unknown>;
       return copyErrorMeta(e, {
-        name: typeof e.name === "string" ? e.name : "Error",
+        name: nameOf(e),
         message: redactSecrets(String(e.message ?? "")),
       });
     }
@@ -118,14 +138,29 @@ export function toSerializedError(err: unknown): SerializedError | null {
  *
  * The Core also runs every failure it publishes through this before projecting
  * it with `toSerializedError`, and keeps the result as the server-side
- * `AmiVoiceCore.originalError` — so its `message` / `stack` are redacted by the
- * same rule. It can throw on a hostile value (a throwing `message` getter); the
- * Core guards that call.
+ * `AmiVoiceCore.originalError`, which an integrator hands whole to an error
+ * tracker or a log. So the APPKEY is redacted from all of an `Error`, not only
+ * its `message` / `stack`: `redactErrorInPlace` covers the `cause` chain and the
+ * extra fields, in place, so the same instance is returned (SPEC §14). If a
+ * secret sits where it cannot be overwritten (a frozen `cause`, a read-only
+ * field), the instance is not returned: it is rebuilt from its redacted
+ * `name` / `message` / `stack` / `code` / `resultCode` / `retryable`, like a
+ * frozen `Error`, without `cause` or other fields.
+ *
+ * It can throw on a hostile value (a throwing `message` getter); the Core
+ * guards that call.
  */
 export function toError(err: unknown): Error {
   const normalised = normaliseError(err);
-  if (normalised instanceof Error) return normalised;
+  if (normalised instanceof Error) {
+    return redactErrorInPlace(normalised) ? normalised : fromSerialized(snapshotOf(normalised));
+  }
   if (normalised === null) return new Error(String(err));
+  return fromSerialized(normalised);
+}
+
+/** An `Error` carrying a `SerializedError`'s fields (`toError`'s rebuild). */
+function fromSerialized(normalised: SerializedError): Error {
   const out = new Error(normalised.message) as Error & Omit<SerializedError, "name" | "message" | "stack">;
   out.name = normalised.name;
   if (normalised.stack !== undefined) out.stack = normalised.stack;
